@@ -2,6 +2,11 @@
 """
 srt_viewer.py  –  DJI Air 3S SRT Flight Log Viewer
 Entry point.
+
+Build commands
+source .venv/bin/activate
+.venv/bin/pyinstaller --onedir --windowed --clean --noconfirm --target-arch arm64 --name "DJI SRT Viewer" srt_viewer.py
+cp -r "dist/DJI SRT Viewer.app" /Applications/
 """
 
 import tkinter as tk
