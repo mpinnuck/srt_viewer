@@ -30,11 +30,6 @@ matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-try:
-    import contextily as ctx
-    _HAS_CONTEXTILY = True
-except ImportError:
-    _HAS_CONTEXTILY = False
 from matplotlib.figure import Figure
 import matplotlib.patheffects as pe
 import numpy as np
@@ -43,7 +38,7 @@ from config import Config
 from controller import Controller
 
 
-APP_VERSION = '1.0.0'
+APP_VERSION = '1.1.0'
 
 # ---------------------------------------------------------------------------
 # Colour palette
@@ -364,16 +359,64 @@ class GUI:
         ax.set_aspect('equal', adjustable='box')
 
         # Satellite basemap
-        if _HAS_CONTEXTILY:
-            try:
-                ctx.add_basemap(ax, crs='EPSG:4326',
-                                source=ctx.providers.Esri.WorldImagery,
-                                zoom='auto', attribution=False)
-            except Exception:
-                pass  # no internet or tile fetch failed — keep plain background
+        self._add_satellite_basemap(ax, lats, lons)
 
         self._map_fig.tight_layout(pad=0.5)
         self._map_canvas.draw()
+
+    # ---- Satellite basemap --------------------------------------------
+
+    def _add_satellite_basemap(self, ax, lats, lons):
+        try:
+            import mercantile, requests, io
+            from PIL import Image
+
+            lat_span = max(lats) - min(lats) or 0.01
+            lon_span = max(lons) - min(lons) or 0.01
+            pad = 0.15
+            lat_min = min(lats) - lat_span * pad
+            lat_max = max(lats) + lat_span * pad
+            lon_min = min(lons) - lon_span * pad
+            lon_max = max(lons) + lon_span * pad
+
+            max_span = max(lat_max - lat_min, lon_max - lon_min)
+            zoom = max(12, min(17, round(math.log2(360 / max_span)) + 3))
+
+            tiles = list(mercantile.tiles(lon_min, lat_min, lon_max, lat_max, zooms=zoom))
+            if len(tiles) > 36:
+                zoom -= 1
+                tiles = list(mercantile.tiles(lon_min, lat_min, lon_max, lat_max, zooms=zoom))
+
+            headers = {'User-Agent': 'DJI-SRT-Viewer/1.0'}
+            fetched = {}
+            for t in tiles:
+                url = (f"https://server.arcgisonline.com/ArcGIS/rest/services/"
+                       f"World_Imagery/MapServer/tile/{t.z}/{t.y}/{t.x}")
+                r = requests.get(url, timeout=8, headers=headers)
+                if r.status_code == 200:
+                    fetched[t] = Image.open(io.BytesIO(r.content)).convert('RGB')
+
+            if not fetched:
+                return
+
+            xs = sorted({t.x for t in fetched})
+            ys = sorted({t.y for t in fetched})
+            x_min, x_max = xs[0], xs[-1]
+            y_min, y_max = ys[0], ys[-1]
+
+            tile_px = 256
+            mosaic = Image.new('RGB', ((x_max - x_min + 1) * tile_px,
+                                       (y_max - y_min + 1) * tile_px))
+            for t, img in fetched.items():
+                mosaic.paste(img, ((t.x - x_min) * tile_px, (t.y - y_min) * tile_px))
+
+            nw = mercantile.bounds(mercantile.Tile(x_min, y_min, zoom))
+            se = mercantile.bounds(mercantile.Tile(x_max, y_max, zoom))
+            ax.imshow(np.array(mosaic),
+                      extent=[nw.west, se.east, se.south, nw.north],
+                      aspect='auto', interpolation='bilinear', zorder=0)
+        except Exception:
+            pass  # no internet or missing library — plain background
 
     # ---- Altitude chart -----------------------------------------------
 

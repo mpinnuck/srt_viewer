@@ -5,7 +5,7 @@ Entry point.
 
 Build commands
 source .venv/bin/activate
-.venv/bin/pyinstaller --onedir --windowed --clean --noconfirm --target-arch arm64 --name "DJI SRT Viewer" srt_viewer.py
+.venv/bin/pyinstaller --clean --noconfirm "DJI SRT Viewer.spec"
 cp -r "dist/DJI SRT Viewer.app" /Applications/
 """
 
