@@ -39,7 +39,7 @@ from config import Config
 from controller import Controller
 
 
-APP_VERSION = '1.2.0'
+APP_VERSION = '1.3.0'
 
 # ---------------------------------------------------------------------------
 # Colour palette

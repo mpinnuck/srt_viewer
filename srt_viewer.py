@@ -9,10 +9,13 @@ source .venv/bin/activate
 cp -r "dist/DJI SRT Viewer.app" /Applications/
 """
 
+import threading
 import tkinter as tk
 from config import Config
 from controller import Controller
-from gui import GUI
+
+BG      = '#1e1e2e'
+SUBTEXT = '#6c7086'
 
 
 def main():
@@ -20,7 +23,29 @@ def main():
     controller = Controller(config)
 
     root = tk.Tk()
-    app  = GUI(root, config, controller)
+    root.title("DJI Air 3S  –  SRT Flight Log Viewer")
+    root.configure(bg=BG)
+
+    w = config.get('window_width',  1400)
+    h = config.get('window_height', 860)
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+
+    splash = tk.Label(root, text='Loading…', bg=BG, fg=SUBTEXT,
+                      font=('SF Pro Display', 13))
+    splash.pack(expand=True)
+    root.update()
+
+    def _load():
+        from gui import GUI
+        root.after(0, lambda: _launch(GUI))
+
+    def _launch(GUI):
+        splash.destroy()
+        GUI(root, config, controller)
+
+    threading.Thread(target=_load, daemon=True).start()
     root.mainloop()
 
 
