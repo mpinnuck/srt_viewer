@@ -26,20 +26,29 @@ import platform
 import threading
 from typing import Optional
 
-import matplotlib
-matplotlib.use('TkAgg')
-import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
-import matplotlib.patheffects as pe
-import numpy as np
-
 from config import Config
 from controller import Controller
 
+_mpl_ready = False
 
-APP_VERSION = '1.3.0'
+def _ensure_matplotlib():
+    global _mpl_ready
+    if _mpl_ready:
+        return
+    import os
+    mpl_cache = os.path.join(os.path.expanduser('~'), '.dji_srt_viewer', 'matplotlib')
+    os.makedirs(mpl_cache, exist_ok=True)
+    os.environ.setdefault('MPLCONFIGDIR', mpl_cache)
+    import importlib
+    import matplotlib
+    matplotlib.use('TkAgg')
+    for _m in ('matplotlib.pyplot', 'matplotlib.colors', 'matplotlib.figure',
+               'matplotlib.backends.backend_tkagg', 'numpy'):
+        importlib.import_module(_m)
+    _mpl_ready = True
+
+
+APP_VERSION = '1.4.0'
 
 # ---------------------------------------------------------------------------
 # Colour palette
@@ -78,6 +87,9 @@ class GUI:
         self._build_toolbar()
         self._build_main_area()
         self._build_statusbar()
+
+        # Import matplotlib in background immediately so it's ready by first file open
+        threading.Thread(target=_ensure_matplotlib, daemon=True).start()
 
         # Try reopen last file
         last = config.get('last_srt_dir', '')
@@ -175,12 +187,9 @@ class GUI:
                               font=('SF Pro Display', 9, 'bold'))
         map_label.pack(side=tk.TOP, anchor=tk.W, padx=8, pady=(4, 0))
 
-        self._map_fig  = Figure(figsize=(7, 6), facecolor=BG)
-        self._map_ax   = self._map_fig.add_subplot(111)
-        self._map_cbar = None
-        self._style_ax(self._map_ax)
-        self._map_canvas = FigureCanvasTkAgg(self._map_fig, master=left)
-        self._map_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self._map_parent = left
+        self._map_placeholder = tk.Frame(left, bg=BG2)
+        self._map_placeholder.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
         # --- Right: Summary + charts ---
         right = tk.PanedWindow(paned, orient=tk.VERTICAL,
@@ -211,11 +220,9 @@ class GUI:
                   foreground=GREEN, font=('SF Pro Display', 9, 'bold')
                   ).pack(anchor=tk.W, padx=8, pady=(4, 0))
 
-        self._alt_fig = Figure(figsize=(5, 2), facecolor=BG)
-        self._alt_ax  = self._alt_fig.add_subplot(111)
-        self._style_ax(self._alt_ax)
-        self._alt_canvas = FigureCanvasTkAgg(self._alt_fig, master=alt_frame)
-        self._alt_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=4)
+        self._alt_parent = alt_frame
+        self._alt_placeholder = tk.Frame(alt_frame, bg=BG2)
+        self._alt_placeholder.pack(fill=tk.BOTH, expand=True, padx=4)
 
         # Speed chart
         spd_frame = ttk.Frame(right)
@@ -225,11 +232,53 @@ class GUI:
                   foreground=YELLOW, font=('SF Pro Display', 9, 'bold')
                   ).pack(anchor=tk.W, padx=8, pady=(4, 0))
 
+        self._spd_parent = spd_frame
+        self._spd_placeholder = tk.Frame(spd_frame, bg=BG2)
+        self._spd_placeholder.pack(fill=tk.BOTH, expand=True, padx=4)
+
+        self._mpl_ready = False
+
+    def _init_mpl_async(self):
+        """Show toast, import matplotlib on a background thread, then build canvases."""
+        toast = tk.Label(self._map_placeholder, text='Please wait — initialising charts…',
+                         bg=BG2, fg=SUBTEXT, font=('SF Pro Display', 12))
+        toast.place(relx=0.5, rely=0.5, anchor='center')
+
+        def _bg():
+            _ensure_matplotlib()
+            self.root.after(0, self._create_matplotlib_canvases)
+
+        threading.Thread(target=_bg, daemon=True).start()
+
+    def _create_matplotlib_canvases(self):
+        """Runs on main thread after matplotlib is imported. Creates figures and canvases."""
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.figure import Figure
+
+        self._map_placeholder.destroy()
+        self._map_fig  = Figure(figsize=(7, 6), facecolor=BG)
+        self._map_ax   = self._map_fig.add_subplot(111)
+        self._map_cbar = None
+        self._style_ax(self._map_ax)
+        self._map_canvas = FigureCanvasTkAgg(self._map_fig, master=self._map_parent)
+        self._map_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        self._alt_placeholder.destroy()
+        self._alt_fig = Figure(figsize=(5, 2), facecolor=BG)
+        self._alt_ax  = self._alt_fig.add_subplot(111)
+        self._style_ax(self._alt_ax)
+        self._alt_canvas = FigureCanvasTkAgg(self._alt_fig, master=self._alt_parent)
+        self._alt_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=4)
+
+        self._spd_placeholder.destroy()
         self._spd_fig = Figure(figsize=(5, 2), facecolor=BG)
         self._spd_ax  = self._spd_fig.add_subplot(111)
         self._style_ax(self._spd_ax)
-        self._spd_canvas = FigureCanvasTkAgg(self._spd_fig, master=spd_frame)
+        self._spd_canvas = FigureCanvasTkAgg(self._spd_fig, master=self._spd_parent)
         self._spd_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=4)
+
+        self._mpl_ready = True
+        self._redraw_all()
 
     def _style_ax(self, ax):
         ax.set_facecolor(BG2)
@@ -305,7 +354,13 @@ class GUI:
             self._show_progress(False)
             self._status(f"Loaded  {len(self.controller.frames):,} samples  "
                          f"from  {os.path.basename(self.controller.filepath)}")
-            self._redraw_all()
+            if self._mpl_ready:
+                self._redraw_all()
+            elif _mpl_ready:
+                # prefetch finished — canvases just need creating (fast, no toast needed)
+                self._create_matplotlib_canvases()
+            else:
+                self._init_mpl_async()
         self.root.after(0, _do)
 
     def _on_load_error(self, msg: str):
@@ -334,6 +389,7 @@ class GUI:
     # ---- Map ----------------------------------------------------------
 
     def _draw_map(self):
+        import matplotlib.pyplot as plt
         ax = self._map_ax
         ax.clear()
         self._style_ax(ax)
@@ -396,7 +452,7 @@ class GUI:
     def _fetch_tile_mosaic(self, lats, lons, generation):
         """Runs on a background thread. Fetches tiles and schedules composite."""
         try:
-            import mercantile, requests, io
+            import mercantile, requests, io, numpy as np
             from PIL import Image
 
             lat_span = max(lats) - min(lats) or 0.01
