@@ -1,0 +1,7 @@
+matplotlib
+pillow
+requests
+mercantile
+
+# Build only — not needed at runtime
+pyinstaller

@@ -6,7 +6,7 @@ a = Analysis(
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['mercantile', 'requests', 'PIL'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -46,5 +46,5 @@ app = BUNDLE(
     coll,
     name='DJI SRT Viewer.app',
     icon=None,
-    bundle_identifier=None,
+    bundle_identifier='com.microconcepts.dji-srt-viewer',
 )

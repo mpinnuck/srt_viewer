@@ -112,7 +112,8 @@ class Controller:
             f"Total frames:  {s['frame_count']:,}",
             f"Sampled:       {s['sample_count']:,} points (1/sec)",
             f"Distance:      {dist_km:.2f} km",
-            f"Max altitude:  {s['max_alt_m']:.1f} m (rel)",
+            f"Max altitude:  {s['max_abs_alt_m']:.1f} m (abs)" if self.config.get('alt_type', 'rel') == 'abs'
+            else f"Max altitude:  {s['max_alt_m']:.1f} m (rel)",
             f"Max speed:     {s['max_speed_kmh']:.1f} km/h",
             f"Avg speed:     {s['avg_speed_kmh']:.1f} km/h",
             f"Home point:    {s['home_lat']:.6f}, {s['home_lon']:.6f}",
@@ -153,25 +154,19 @@ class Controller:
         """Export GPS track to KML for Google Earth."""
         if not self.frames:
             raise RuntimeError('No data to export.')
+        home = self.frames[0]
         with open(out_path, 'w') as f:
             f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-            f.write('<kml xmlns="http://www.opengis.net/kml/2.2">\n')
-            f.write('<Document>\n')
+            f.write('<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n')
             f.write(f'  <name>{os.path.basename(self.filepath)}</name>\n')
-            f.write('  <Placemark>\n')
-            f.write('    <name>Flight Path</name>\n')
-            f.write('    <LineString>\n')
-            f.write('      <altitudeMode>absolute</altitudeMode>\n')
+            f.write('  <Style id="track"><LineStyle><color>ff00aaff</color><width>4</width></LineStyle></Style>\n')
+            f.write('  <Style id="home"><IconStyle><color>ff00ff00</color><scale>1.2</scale></IconStyle></Style>\n')
+            f.write('  <Placemark><name>Flight Path</name><styleUrl>#track</styleUrl>\n')
+            f.write('    <LineString><tessellate>1</tessellate><altitudeMode>clampToGround</altitudeMode>\n')
             f.write('      <coordinates>\n')
             for fr in self.frames:
-                f.write(f'        {fr.longitude:.6f},{fr.latitude:.6f},{fr.abs_alt:.2f}\n')
-            f.write('      </coordinates>\n')
-            f.write('    </LineString>\n')
-            f.write('  </Placemark>\n')
-            # Home point marker
-            home = self.frames[0]
-            f.write('  <Placemark>\n')
-            f.write('    <name>Home</name>\n')
+                f.write(f'        {fr.longitude:.6f},{fr.latitude:.6f},0\n')
+            f.write('      </coordinates></LineString></Placemark>\n')
+            f.write('  <Placemark><name>Home</name><styleUrl>#home</styleUrl>\n')
             f.write(f'    <Point><coordinates>{home.longitude:.6f},{home.latitude:.6f},0</coordinates></Point>\n')
-            f.write('  </Placemark>\n')
-            f.write('</Document>\n</kml>\n')
+            f.write('  </Placemark>\n</Document>\n</kml>\n')

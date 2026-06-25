@@ -23,6 +23,7 @@ import webbrowser
 import tempfile
 import subprocess
 import platform
+import threading
 from typing import Optional
 
 import matplotlib
@@ -38,7 +39,7 @@ from config import Config
 from controller import Controller
 
 
-APP_VERSION = '1.1.0'
+APP_VERSION = '1.2.0'
 
 # ---------------------------------------------------------------------------
 # Colour palette
@@ -67,6 +68,11 @@ class GUI:
         controller.on_load_progress = self._on_progress
         controller.on_load_complete  = self._on_load_complete
         controller.on_load_error     = self._on_load_error
+
+        self._pending_progress: Optional[float] = None
+        self._progress_polling = False
+        self._tile_generation  = 0
+        self._temp_files: list  = []
 
         self._setup_window()
         self._build_toolbar()
@@ -146,7 +152,7 @@ class GUI:
                   ).pack(side=tk.RIGHT, padx=(0, 10))
         ttk.Label(bar, text='Altitude:').pack(side=tk.RIGHT, padx=(4, 0))
         self._alt_var = tk.StringVar(value=self.config.get('alt_type', 'rel'))
-        for val, label in [('rel', 'Relative'), ('abs', 'Absolute')]:
+        for val, label in [('abs', 'Absolute'), ('rel', 'Relative')]:
             rb = ttk.Radiobutton(bar, text=label, variable=self._alt_var,
                                  value=val, command=self._redraw_charts)
             rb.pack(side=tk.RIGHT, padx=2)
@@ -169,8 +175,9 @@ class GUI:
                               font=('SF Pro Display', 9, 'bold'))
         map_label.pack(side=tk.TOP, anchor=tk.W, padx=8, pady=(4, 0))
 
-        self._map_fig = Figure(figsize=(7, 6), facecolor=BG)
-        self._map_ax  = self._map_fig.add_subplot(111)
+        self._map_fig  = Figure(figsize=(7, 6), facecolor=BG)
+        self._map_ax   = self._map_fig.add_subplot(111)
+        self._map_cbar = None
         self._style_ax(self._map_ax)
         self._map_canvas = FigureCanvasTkAgg(self._map_fig, master=left)
         self._map_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
@@ -270,16 +277,28 @@ class GUI:
             if show:
                 self._progress_bar.pack(side=tk.LEFT, padx=16)
                 self._progress_label.pack(side=tk.LEFT)
+                self._pending_progress = None
+                if not self._progress_polling:
+                    self._progress_polling = True
+                    self._poll_progress()
             else:
+                self._progress_polling = False
                 self._progress_bar.pack_forget()
                 self._progress_label.pack_forget()
         self.root.after(0, _do)
 
     def _on_progress(self, pct: float):
-        def _do():
+        self._pending_progress = pct  # written by background thread; GIL makes float assignment atomic
+
+    def _poll_progress(self):
+        if not self._progress_polling:
+            return
+        pct = self._pending_progress
+        if pct is not None:
             self._progress_var.set(pct)
             self._progress_label.config(text=f'{pct:.0f}%')
-        self.root.after(0, _do)
+            self._pending_progress = None
+        self.root.after(100, self._poll_progress)
 
     def _on_load_complete(self):
         def _do():
@@ -340,13 +359,15 @@ class GUI:
         ax.scatter([lons[-1]], [lats[-1]], c=RED,    s=80,  zorder=5,
                    marker='X', label='End')
 
-        # Colourbar
+        # Colourbar — remove stale instance before creating a new one
+        if self._map_cbar is not None:
+            self._map_cbar.remove()
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
-        cbar = self._map_fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
-        cbar.set_label('Altitude (m)', color=TEXT, fontsize=8)
-        cbar.ax.yaxis.set_tick_params(color=SUBTEXT, labelsize=7)
-        plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color=SUBTEXT)
+        self._map_cbar = self._map_fig.colorbar(sm, ax=ax, fraction=0.03, pad=0.02)
+        self._map_cbar.set_label('Altitude (m)', color=TEXT, fontsize=8)
+        self._map_cbar.ax.yaxis.set_tick_params(color=SUBTEXT, labelsize=7)
+        plt.setp(plt.getp(self._map_cbar.ax.axes, 'yticklabels'), color=SUBTEXT)
 
         ax.set_xlabel('Longitude', color=SUBTEXT, fontsize=8)
         ax.set_ylabel('Latitude',  color=SUBTEXT, fontsize=8)
@@ -356,17 +377,24 @@ class GUI:
                   facecolor=BG2, edgecolor=GRID, labelcolor=TEXT)
 
         # Equal-ish aspect for map
-        ax.set_aspect('equal', adjustable='box')
-
-        # Satellite basemap
-        self._add_satellite_basemap(ax, lats, lons)
+        ax.set_aspect('equal', adjustable='datalim')
 
         self._map_fig.tight_layout(pad=0.5)
         self._map_canvas.draw()
 
-    # ---- Satellite basemap --------------------------------------------
+        # Fetch satellite tiles in background; composite when ready
+        self._tile_generation += 1
+        generation = self._tile_generation
+        threading.Thread(
+            target=self._fetch_tile_mosaic,
+            args=(lats, lons, generation),
+            daemon=True,
+        ).start()
 
-    def _add_satellite_basemap(self, ax, lats, lons):
+    # ---- Satellite basemap (background thread + main-thread composite) ----
+
+    def _fetch_tile_mosaic(self, lats, lons, generation):
+        """Runs on a background thread. Fetches tiles and schedules composite."""
         try:
             import mercantile, requests, io
             from PIL import Image
@@ -390,6 +418,8 @@ class GUI:
             headers = {'User-Agent': 'DJI-SRT-Viewer/1.0'}
             fetched = {}
             for t in tiles:
+                if generation != self._tile_generation:
+                    return  # map redrawn — abandon this fetch
                 url = (f"https://server.arcgisonline.com/ArcGIS/rest/services/"
                        f"World_Imagery/MapServer/tile/{t.z}/{t.y}/{t.x}")
                 r = requests.get(url, timeout=8, headers=headers)
@@ -412,11 +442,24 @@ class GUI:
 
             nw = mercantile.bounds(mercantile.Tile(x_min, y_min, zoom))
             se = mercantile.bounds(mercantile.Tile(x_max, y_max, zoom))
-            ax.imshow(np.array(mosaic),
-                      extent=[nw.west, se.east, se.south, nw.north],
-                      aspect='auto', interpolation='bilinear', zorder=0)
+            extent = [nw.west, se.east, se.south, nw.north]
+            mosaic_arr = np.array(mosaic)
+
+            self.root.after(0, lambda: self._apply_basemap(mosaic_arr, extent, generation))
         except Exception:
-            pass  # no internet or missing library — plain background
+            pass  # no internet or missing library — plain background kept
+
+    def _apply_basemap(self, mosaic_arr, extent, generation):
+        """Runs on the main thread. Composites tiles behind the flight path."""
+        if generation != self._tile_generation:
+            return  # stale — a newer map has since been drawn
+        ax = self._map_ax
+        xlim, ylim = ax.get_xlim(), ax.get_ylim()
+        ax.imshow(mosaic_arr, extent=extent, aspect='auto',
+                  interpolation='bilinear', zorder=0)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        self._map_canvas.draw()
 
     # ---- Altitude chart -----------------------------------------------
 
@@ -542,6 +585,7 @@ L.circleMarker(coords[coords.length-1],{{radius:8,color:'#f38ba8',fillColor:'#f3
             fd, html_path = tempfile.mkstemp(suffix='.html', prefix='dji_srt_maps_')
             with os.fdopen(fd, 'w') as f:
                 f.write(html)
+            self._temp_files.append(html_path)
             webbrowser.open(f'file://{html_path}')
         except Exception as e:
             messagebox.showerror('Google Maps', str(e))
@@ -550,32 +594,16 @@ L.circleMarker(coords[coords.length-1],{{radius:8,color:'#f38ba8',fillColor:'#f3
         if not self.controller.loaded:
             messagebox.showinfo('Google Earth', 'Load an SRT file first.')
             return
-        frames = self.controller.frames
-        s = self.controller.stats
         try:
             fd, kml_path = tempfile.mkstemp(suffix='.kml', prefix='dji_srt_earth_')
-            with os.fdopen(fd, 'w') as f:
-                f.write('<?xml version="1.0" encoding="UTF-8"?>\n')
-                f.write('<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n')
-                f.write(f'  <name>{os.path.basename(self.controller.filepath)}</name>\n')
-                f.write('  <Style id="track"><LineStyle><color>ff00aaff</color><width>4</width></LineStyle></Style>\n')
-                f.write('  <Style id="home"><IconStyle><color>ff00ff00</color><scale>1.2</scale></IconStyle></Style>\n')
-                f.write('  <Placemark><name>Flight Path</name><styleUrl>#track</styleUrl>\n')
-                f.write('    <LineString><tessellate>1</tessellate><altitudeMode>clampToGround</altitudeMode>\n')
-                f.write('      <coordinates>\n')
-                for fr in frames:
-                    f.write(f'        {fr.longitude:.6f},{fr.latitude:.6f},0\n')
-                f.write('      </coordinates></LineString></Placemark>\n')
-                home = frames[0]
-                f.write('  <Placemark><name>Home</name><styleUrl>#home</styleUrl>\n')
-                f.write(f'    <Point><coordinates>{home.longitude:.6f},{home.latitude:.6f},0</coordinates></Point>\n')
-                f.write('  </Placemark>\n</Document>\n</kml>\n')
-
+            os.close(fd)
+            self.controller.export_kml(kml_path)
+            self._temp_files.append(kml_path)
             sys = platform.system()
             if sys == 'Darwin':
                 subprocess.Popen(['open', kml_path])
             elif sys == 'Windows':
-                os.startfile(kml_path)
+                os.startfile(kml_path)  # os.startfile is Windows-only; safe here as branch is Windows-gated
             else:
                 subprocess.Popen(['xdg-open', kml_path])
         except Exception as e:
@@ -586,7 +614,12 @@ L.circleMarker(coords[coords.length-1],{{radius:8,color:'#f38ba8',fillColor:'#f3
     # ------------------------------------------------------------------
 
     def _on_close(self):
-        # Save window size
+        for path in self._temp_files:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
         w = self.root.winfo_width()
         h = self.root.winfo_height()
         self.config.set('window_width',  w)

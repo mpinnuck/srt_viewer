@@ -54,8 +54,6 @@ _BLOCK_PATTERN = re.compile(
     re.DOTALL
 )
 
-_VTT_PATTERN = re.compile(r'(\d{2}:\d{2}:\d{2}),(\d{3})\s*-->')
-
 
 def _parse_video_time(vtt_start: str) -> float:
     """Convert SRT timestamp '00:01:23,456' to seconds."""
@@ -171,7 +169,8 @@ class SRTParser:
             return {}
         lats    = [f.latitude  for f in frames]
         lons    = [f.longitude for f in frames]
-        alts    = [f.rel_alt   for f in frames]
+        alts     = [f.rel_alt for f in frames]
+        abs_alts = [f.abs_alt for f in frames]
         speeds  = [f.speed_kmh for f in frames]
         duration = (frames[-1].timestamp - frames[0].timestamp).total_seconds()
 
@@ -189,6 +188,7 @@ class SRTParser:
             'start_time':    frames[0].timestamp,
             'end_time':      frames[-1].timestamp,
             'max_alt_m':     max(alts),
+            'max_abs_alt_m': max(abs_alts),
             'max_speed_kmh': max(speeds),
             'avg_speed_kmh': sum(speeds) / len(speeds),
             'total_dist_m':  total_dist,
