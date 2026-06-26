@@ -7,8 +7,8 @@ A desktop application for visualising flight telemetry from DJI Air 3S `.SRT` su
 ## Features
 
 - **Satellite map** — GPS track coloured by altitude, plotted over live Esri World Imagery satellite tiles
-- **Altitude chart** — time-series plot, switchable between relative (above home point) and absolute (above sea level)
-- **Speed chart** — time-series plot in km/h
+- **Altitude chart** — time-series plot, switchable between relative (above home point) and absolute (above sea level); overlays a **HAG (Height Above Ground)** line fetched from the Open-Meteo terrain API
+- **Speed chart** — time-series plot in km/h, with guards against DJI timestamp glitches and frozen-GPS artefacts
 - **Flight summary** — date/time, duration, distance, max and average speed, max altitude, home point coordinates
 - **Export CSV** — all telemetry fields at 1 sample/second (frame, timestamp, lat/lon, altitude, speed, ISO, shutter, f-number, focal length, colour temperature)
 - **Export KML** — GPS track and home point marker for use in any GIS tool
@@ -37,7 +37,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install dependencies
-pip install matplotlib mercantile requests pillow
+pip install matplotlib numpy mercantile requests pillow
 ```
 
 ---
@@ -89,10 +89,20 @@ The **FLIGHT PATH** panel shows the GPS track drawn as a coloured line over a sa
 
 ### Reading the charts
 
-- **ALTITUDE** — shows relative altitude (metres above the home point) by default. Switch to absolute altitude (metres above sea level) using the **Relative / Absolute** toggle in the toolbar.
-- **SPEED** — ground speed in km/h derived from consecutive GPS positions.
+- **ALTITUDE** — shows relative altitude (metres above the home point) by default. Switch to absolute altitude (metres above sea level) using the **Relative / Absolute** toggle in the toolbar. A dashed **HAG** line (Height Above Ground) is overlaid on the same scale once terrain data has been fetched from the Open-Meteo API (usually within a second of loading). Both lines share the same left-axis scale so the gap between them directly shows terrain rise below the drone.
+- **SPEED** — ground speed in km/h derived from consecutive GPS positions. Samples where the GPS position has not changed are skipped to avoid frozen-coordinate artefacts. Timestamp glitches in the SRT file (a DJI firmware quirk where the clock resets mid-recording) are detected and suppressed; affected frames show as a brief zero rather than an impossible speed spike.
 
 Both charts share the same time axis (minutes from takeoff).
+
+### HAG (Height Above Ground)
+
+HAG is computed datum-independently using only relative values:
+
+```
+HAG = rel_alt + (terrain_elevation_at_home − terrain_elevation_at_current_position)
+```
+
+`rel_alt` is a pure barometric difference, and the terrain term is a relative difference, so any offset between the drone's barometric reference and the Open-Meteo MSL datum cancels out. For a constant-HAG waypoint mission the HAG line is flat regardless of the terrain profile below it.
 
 ### Flight summary
 

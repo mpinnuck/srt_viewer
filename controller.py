@@ -2,6 +2,24 @@
 controller.py  –  ViewModel / Controller for DJI SRT Viewer.
 
 Sits between the GUI and the SRTParser; drives all data operations.
+
+Terrain / HAG
+-------------
+After an SRT file is loaded, fetch_terrain() fires a background thread that
+calls the Open-Meteo elevation API (free, no key required) to obtain terrain
+elevation for a 1-in-10 subsample of the flight's GPS track, then
+linearly interpolates back to every frame.  This keeps the request well within
+the API's rate limit (≤100 coordinates per call).
+
+HAG (Height Above Ground) is calculated datum-independently:
+
+    HAG[i] = rel_alt[i] + (terrain_elevation[home] − terrain_elevation[i])
+
+rel_alt is a pure barometric difference (abs_alt_current − abs_alt_takeoff),
+so no geodetic datum is involved.  The terrain term is also a relative
+difference, so any fixed offset between the barometric reference and
+Open-Meteo's MSL datum cancels out.  For a constant-HAG waypoint mission the
+resulting HAG series is flat regardless of terrain.
 """
 
 from __future__ import annotations
@@ -28,11 +46,15 @@ class Controller:
         self.frames:   List[FlightFrame] = []
         self.stats:    dict = {}
         self.filepath: str = ''
+        self.terrain_elevations: Optional[List[float]] = None
+        self.terrain_state: str = 'idle'   # 'idle' | 'fetching' | 'ready' | 'error'
 
         # Callbacks registered by the GUI
         self.on_load_progress:  Optional[Callable[[float], None]] = None
         self.on_load_complete:  Optional[Callable[[], None]]      = None
         self.on_load_error:     Optional[Callable[[str], None]]   = None
+        self.on_terrain_ready:  Optional[Callable[[], None]]      = None
+        self.on_terrain_error:  Optional[Callable[[str], None]]   = None
 
     # ------------------------------------------------------------------
     # File loading (async)
@@ -50,6 +72,8 @@ class Controller:
 
     def _load_worker(self, filepath: str):
         try:
+            self.terrain_elevations = None   # clear stale terrain on new file
+            self.terrain_state      = 'idle'
             self._parser.stride = self.config.get('stride', 60)
             self.frames = self._parser.parse(
                 filepath,
@@ -86,6 +110,61 @@ class Controller:
         alts  = [f.rel_alt if alt_type == 'rel' else f.abs_alt
                  for f in self.frames]
         return times, alts
+
+    def fetch_terrain(self):
+        """Start a background thread to fetch terrain elevation for all GPS points."""
+        self.terrain_state = 'fetching'
+        threading.Thread(target=self._terrain_worker, daemon=True).start()
+
+    def _terrain_worker(self):
+        try:
+            import requests
+            import numpy as np
+
+            # Sample every 10th frame — terrain changes slowly (1 batch, no rate limiting)
+            STRIDE = 10
+            sampled_indices = list(range(0, len(self.frames), STRIDE))
+            if sampled_indices[-1] != len(self.frames) - 1:
+                sampled_indices.append(len(self.frames) - 1)
+            sampled = [self.frames[i] for i in sampled_indices]
+
+            resp = requests.get(
+                'https://api.open-meteo.com/v1/elevation',
+                params={
+                    'latitude':  ','.join(f'{f.latitude:.6f}'  for f in sampled),
+                    'longitude': ','.join(f'{f.longitude:.6f}' for f in sampled),
+                },
+                timeout=20,
+            )
+            resp.raise_for_status()
+            sampled_elevs = resp.json()['elevation']
+
+            # Interpolate back to full frame count
+            all_indices = list(range(len(self.frames)))
+            self.terrain_elevations = list(
+                np.interp(all_indices, sampled_indices, sampled_elevs)
+            )
+            self.terrain_state = 'ready'
+            if self.on_terrain_ready:
+                self.on_terrain_ready()
+        except Exception as e:
+            self.terrain_state = 'error'
+            if self.on_terrain_error:
+                self.on_terrain_error(str(e))
+
+    def hag_series(self):
+        """Return (times_s, hag_m).
+
+        Returns an empty hag list if terrain data has not yet been fetched.
+        """
+        times = [(f.timestamp - self.frames[0].timestamp).total_seconds()
+                 for f in self.frames]
+        if not self.terrain_elevations or len(self.terrain_elevations) != len(self.frames):
+            return times, []
+        terrain_home = self.terrain_elevations[0]
+        hags = [f.rel_alt - (elev - terrain_home)
+                for f, elev in zip(self.frames, self.terrain_elevations)]
+        return times, hags
 
     def speed_series(self):
         """Return (times_s, speeds) in configured unit."""

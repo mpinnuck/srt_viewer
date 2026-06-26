@@ -1,8 +1,32 @@
 """
 srt_parser.py  –  DJI Air 3S SRT telemetry file parser.
 
-Parses every Nth frame (default stride=60 → 1 sample per second at 60fps)
-and returns a list of FlightFrame dataclass instances.
+Sampling strategy
+-----------------
+The SRT file contains one block per video frame (60 fps → ~57 000 blocks for a
+15-minute flight).  The GPS receiver inside the drone updates at 10 Hz, so
+consecutive frames often carry identical coordinates.
+
+Rather than sampling every Nth *frame* (which risks landing on a frozen-GPS
+frame and producing a false zero/double-speed spike pair), the parser counts
+GPS *change* events and keeps every stride-th change.  At 10 Hz GPS and
+stride=10 this yields ~1 genuine position update per second — the same
+effective rate as before, but every sample is guaranteed to have a real
+position delta.
+
+Speed calculation
+-----------------
+Ground speed is derived from consecutive (lat, lon) pairs and the wall-clock
+timestamp delta.  Two guards are applied to handle DJI firmware quirks:
+
+* dt ≤ 0.1 s — DJI's SRT writer occasionally resets its timestamp counter at
+  a buffer boundary, causing the timestamp to jump backwards by several
+  seconds mid-flight.  Any sample pair with a non-positive or implausibly
+  small dt is skipped (speed left at 0.0).
+
+* speed > MAX_SPEED_MS — residual outliers from any other cause are clamped to
+  0.0 rather than propagated as spikes.  Glitch frames appear as brief dips on
+  the speed chart rather than impossible 140 km/h spikes.
 """
 
 import re
@@ -101,12 +125,29 @@ class SRTParser:
         total  = len(blocks)
         frames: List[FlightFrame] = []
 
-        for i, block in enumerate(blocks):
-            if i % self.stride != 0:
-                continue
+        # Count GPS-change events so we subsample on real position updates,
+        # not fixed frame indices — avoids frozen-GPS speed spikes.
+        last_lat: Optional[float] = None
+        last_lon: Optional[float] = None
+        gps_change_count = 0
 
+        for i, block in enumerate(blocks):
             m = _BLOCK_PATTERN.search(block)
             if not m:
+                continue
+
+            lat = float(m.group(8))
+            lon = float(m.group(9))
+
+            # Skip frames where GPS hasn't moved since the last fix
+            if lat == last_lat and lon == last_lon:
+                continue
+
+            last_lat, last_lon = lat, lon
+            gps_change_count += 1
+
+            # Subsample: keep 1 in every stride GPS-change events (~1 Hz)
+            if gps_change_count % self.stride != 0:
                 continue
 
             # Parse SRT timestamp from the first line of the block
@@ -129,8 +170,8 @@ class SRTParser:
                 shutter    = m.group(5).strip(),
                 fnum       = float(m.group(6)),
                 focal_len  = float(m.group(7)),
-                latitude   = float(m.group(8)),
-                longitude  = float(m.group(9)),
+                latitude   = lat,
+                longitude  = lon,
                 rel_alt    = float(m.group(10)),
                 abs_alt    = float(m.group(11)),
                 color_temp = int(m.group(12)),
@@ -140,15 +181,21 @@ class SRTParser:
             if progress_callback and i % max(1, total // 100) == 0:
                 progress_callback(i / total * 100)
 
-        # Compute speed from successive GPS positions and time deltas
+        # Compute speed from successive GPS positions and time deltas.
+        # Guard against SRT timestamp glitches (negative or near-zero dt) and
+        # physically impossible speeds caused by DJI firmware timestamp resets.
+        MAX_SPEED_MS = 25.0   # ~90 km/h — well above Air 3S max of ~19 m/s
         for idx in range(1, len(frames)):
             prev, curr = frames[idx - 1], frames[idx]
             dt = (curr.timestamp - prev.timestamp).total_seconds()
-            if dt > 0:
+            if dt > 0.1:
                 dist = _haversine(prev.latitude, prev.longitude,
                                   curr.latitude, curr.longitude)
-                curr.speed_ms  = dist / dt
-                curr.speed_kmh = curr.speed_ms * 3.6
+                speed_ms = dist / dt
+                if speed_ms <= MAX_SPEED_MS:
+                    curr.speed_ms  = speed_ms
+                    curr.speed_kmh = speed_ms * 3.6
+                # else: leave at 0.0 — glitch frame, shows as dip not spike
         if frames:
             frames[0].speed_ms  = 0.0
             frames[0].speed_kmh = 0.0

@@ -48,7 +48,7 @@ def _ensure_matplotlib():
     _mpl_ready = True
 
 
-APP_VERSION = '1.4.0'
+APP_VERSION = '1.5.0'
 
 # ---------------------------------------------------------------------------
 # Colour palette
@@ -77,6 +77,8 @@ class GUI:
         controller.on_load_progress = self._on_progress
         controller.on_load_complete  = self._on_load_complete
         controller.on_load_error     = self._on_load_error
+        controller.on_terrain_ready  = self._on_terrain_ready
+        controller.on_terrain_error  = self._on_terrain_error
 
         self._pending_progress: Optional[float] = None
         self._progress_polling = False
@@ -353,7 +355,9 @@ class GUI:
         def _do():
             self._show_progress(False)
             self._status(f"Loaded  {len(self.controller.frames):,} samples  "
-                         f"from  {os.path.basename(self.controller.filepath)}")
+                         f"from  {os.path.basename(self.controller.filepath)}"
+                         f"  —  fetching terrain elevation…")
+            self.controller.fetch_terrain()
             if self._mpl_ready:
                 self._redraw_all()
             elif _mpl_ready:
@@ -368,6 +372,26 @@ class GUI:
             self._show_progress(False)
             self._status(f'Error: {msg}')
             messagebox.showerror('Load Error', msg)
+        self.root.after(0, _do)
+
+    def _on_terrain_ready(self):
+        def _do():
+            self._status(f"Loaded  {len(self.controller.frames):,} samples  "
+                         f"from  {os.path.basename(self.controller.filepath)}")
+            if self._mpl_ready:
+                self._draw_altitude()
+            # if canvases not ready yet, _redraw_all (called when they are created)
+            # will pick up terrain_elevations automatically — no action needed here
+        self.root.after(0, _do)
+
+    def _on_terrain_error(self, msg: str):
+        def _do():
+            self._status(
+                f"Loaded  {len(self.controller.frames):,} samples  "
+                f"from  {os.path.basename(self.controller.filepath)}"
+                f"  —  terrain unavailable: {msg[:60]}")
+            if self._mpl_ready:
+                self._draw_altitude()
         self.root.after(0, _do)
 
     # ------------------------------------------------------------------
@@ -524,6 +548,10 @@ class GUI:
         ax.clear()
         self._style_ax(ax)
 
+        # Remove any previous HAG twin axis so we start fresh
+        for other in self._alt_fig.axes[1:]:
+            other.remove()
+
         times, alts = self.controller.altitude_series()
         times_min = [t / 60 for t in times]
 
@@ -535,7 +563,33 @@ class GUI:
         ax.set_ylabel(label, color=SUBTEXT, fontsize=7)
         ax.set_xlabel('Time (min)', color=SUBTEXT, fontsize=7)
 
-        self._alt_fig.tight_layout(pad=0.5)
+        # HAG on a fresh right axis each redraw (avoids clear() resetting twinx positioning)
+        times_h, hags = self.controller.hag_series()
+        ax2 = ax.twinx()
+        ax2.set_facecolor('none')
+        ax2.tick_params(axis='y', colors=ACCENT, labelsize=8)
+        for spine in ax2.spines.values():
+            spine.set_color(GRID)
+        ax2.spines['right'].set_color(ACCENT)
+        if hags:
+            times_h_min = [t / 60 for t in times_h]
+            ax2.plot(times_h_min, hags, color=ACCENT, linewidth=1.2, linestyle='--', alpha=0.9)
+            ax2.set_ylabel('HAG (m)', color=ACCENT, fontsize=7)
+            ax2.set_yticks([])
+        else:
+            state = self.controller.terrain_state
+            if state == 'error':
+                lbl = 'HAG — unavailable'
+            elif state == 'fetching':
+                lbl = 'HAG — fetching…'
+            else:
+                lbl = 'HAG'
+            ax2.set_ylabel(lbl, color=SUBTEXT, fontsize=7)
+            ax2.set_yticks([])
+
+        self._alt_fig.tight_layout(pad=0.5, rect=[0, 0, 0.95, 1])
+        if hags:
+            ax2.set_ylim(ax.get_ylim())   # sync AFTER layout is finalised
         self._alt_canvas.draw()
 
     # ---- Speed chart --------------------------------------------------
