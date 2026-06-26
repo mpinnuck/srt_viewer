@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+import platform
+target = platform.machine()  # 'arm64' on Apple Silicon, 'x86_64' on Intel
 
 a = Analysis(
     ['srt_viewer.py'],
@@ -29,7 +30,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch='arm64',
+    target_arch=target,
     codesign_identity=None,
     entitlements_file=None,
 )
