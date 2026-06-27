@@ -1,6 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-import platform
-target = platform.machine()  # 'arm64' on Apple Silicon, 'x86_64' on Intel
+import subprocess
 
 a = Analysis(
     ['srt_viewer.py'],
@@ -11,10 +10,22 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=['psutil'],
     noarchive=False,
     optimize=0,
 )
+
+# Drop any binaries that don't match arm64
+def _arch(path):
+    try:
+        return set(subprocess.check_output(
+            ['lipo', '-archs', path], stderr=subprocess.DEVNULL
+        ).decode().split())
+    except Exception:
+        return {'arm64'}
+
+a.binaries = [(n, p, k) for n, p, k in a.binaries if 'arm64' in _arch(p)]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -30,7 +41,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=target,
+    target_arch='arm64',
     codesign_identity=None,
     entitlements_file=None,
 )

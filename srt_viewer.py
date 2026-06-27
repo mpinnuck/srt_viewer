@@ -9,6 +9,15 @@ source .venv/bin/activate
 cp -r "dist/DJI SRT Viewer.app" /Applications/
 """
 
+import os
+import sys
+
+# Ensure Homebrew binaries (ffmpeg, etc.) are on PATH when launched
+# from Spotlight or Finder, which inherit a minimal environment.
+for _p in ('/opt/homebrew/bin', '/usr/local/bin'):
+    if _p not in os.environ.get('PATH', '') and os.path.isdir(_p):
+        os.environ['PATH'] = _p + ':' + os.environ.get('PATH', '')
+
 import tkinter as tk
 from config import Config
 from controller import Controller

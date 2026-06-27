@@ -71,10 +71,10 @@ class HudConfig:
 
     # Label prefixes
     label_alt:      str  = 'ALT'
-    label_hag:      str  = 'HAG'
     label_speed:    str  = 'SPD'
     label_heading:  str  = 'HDG'
     label_vspeed:   str  = 'V/S'
+    label_hag:      str  = 'HAG'
 
 
 # ---------------------------------------------------------------------------
@@ -122,9 +122,8 @@ def build_hud_frames(srt_path: str,
                      ) -> List[HudFrame]:
     """Re-parse the SRT at full GPS-change resolution and derive HUD fields.
 
-    terrain_elevations: optional list of terrain elevation (m ASL) at each
-    frame's lat/lon, as returned by the Open-Meteo API.  When provided, HAG
-    is computed as: rel_alt - (terrain[i] - terrain[0]).
+    terrain_elevations: optional list aligned to the main app's stride=60 frames.
+    HAG = rel_alt - (terrain[i] - terrain[0]).
     """
     parser = SRTParser(stride=1)   # every GPS change event
     raw: List[FlightFrame] = parser.parse(srt_path, progress_callback=progress_cb)
@@ -147,16 +146,12 @@ def build_hud_frames(srt_path: str,
             if dt > 0.05:
                 vspeed = (fr.rel_alt - raw[idx - 1].rel_alt) / dt
 
-        # HAG: height above ground using terrain elevation at stride=1 index.
-        # terrain_elevations is aligned to the main app's stride=60 frames,
-        # not our stride=1 re-parse, so we interpolate by nearest index.
+        # HAG: interpolate terrain to stride=1 index
         hag: Optional[float] = None
         if terrain_elevations and len(terrain_elevations) > 1:
-            # Map stride=1 index to nearest terrain index
             t_idx = min(int(idx * len(terrain_elevations) / max(len(raw), 1)),
                         len(terrain_elevations) - 1)
-            terrain_home = terrain_elevations[0]
-            hag = fr.rel_alt - (terrain_elevations[t_idx] - terrain_home)
+            hag = fr.rel_alt - (terrain_elevations[t_idx] - terrain_elevations[0])
 
         hud.append(HudFrame(
             video_time = fr.video_time,
@@ -550,5 +545,6 @@ def render_preview_frame(
 
         return np.array(img.convert('RGB'))
 
-    except Exception:
+    except Exception as e:
+        import traceback; traceback.print_exc()
         return None

@@ -49,7 +49,7 @@ def _ensure_matplotlib():
     _mpl_ready = True
 
 
-APP_VERSION = '2.0'
+APP_VERSION = '2.1'
 
 # ---------------------------------------------------------------------------
 # Colour palette
@@ -816,7 +816,6 @@ class HudExportDialog(tk.Toplevel):
         self._show_spd   = tk.BooleanVar(value=bool(config.get('hud_show_speed', True)))
         self._show_hdg   = tk.BooleanVar(value=bool(config.get('hud_show_heading', True)))
         self._show_vs    = tk.BooleanVar(value=bool(config.get('hud_show_vspeed', False)))
-        self._show_hag   = tk.BooleanVar(value=bool(config.get('hud_show_hag', False)))
         self._speed_unit = tk.StringVar(value=config.get('hud_speed_unit', 'kmh'))
         self._alt_type   = tk.StringVar(value=config.get('hud_alt_type', 'rel'))
         self._corner     = tk.StringVar(value=config.get('hud_corner', 'tl'))
@@ -940,10 +939,6 @@ class HudExportDialog(tk.Toplevel):
                         command=self._settings_changed).pack(anchor='w')
         ttk.Checkbutton(fld, text='Vertical speed', variable=self._show_vs,
                         command=self._settings_changed).pack(anchor='w')
-        self._hag_cb = ttk.Checkbutton(fld, text='HAG (requires terrain data)',
-                                        variable=self._show_hag,
-                                        command=self._settings_changed)
-        self._hag_cb.pack(anchor='w')
 
         # ---- Units ----
         units = self._section(parent, 'Units')
@@ -1098,7 +1093,9 @@ class HudExportDialog(tk.Toplevel):
 
     def _show_preview(self, arr):
         if arr is None:
-            self._status('Preview failed — check MP4 path and ffmpeg.')
+            # arr is None — check hud_exporter for the real exception
+            import traceback
+            self._status(f'Preview failed — see terminal for details')
             return
         try:
             from PIL import Image, ImageTk
@@ -1135,7 +1132,6 @@ class HudExportDialog(tk.Toplevel):
             show_speed    = self._show_spd.get(),
             show_heading  = self._show_hdg.get(),
             show_vspeed   = self._show_vs.get(),
-            show_hag      = self._show_hag.get(),
             speed_unit    = self._speed_unit.get(),
             alt_type      = self._alt_type.get(),
             corner        = self._corner.get(),
@@ -1270,7 +1266,6 @@ class HudExportDialog(tk.Toplevel):
         c.set('hud_show_speed',    self._show_spd.get())
         c.set('hud_show_heading',  self._show_hdg.get())
         c.set('hud_show_vspeed',   self._show_vs.get())
-        c.set('hud_show_hag',      self._show_hag.get())
         c.set('hud_speed_unit',    self._speed_unit.get())
         c.set('hud_alt_type',      self._alt_type.get())
         c.set('hud_corner',        self._corner.get())
