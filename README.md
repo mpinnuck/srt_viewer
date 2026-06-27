@@ -1,6 +1,6 @@
 # DJI Air 3S — SRT Flight Log Viewer
 
-A desktop application for visualising flight telemetry from DJI Air 3S `.SRT` subtitle files. Load a flight log to see the GPS track overlaid on a satellite map, with altitude and speed charts, a full flight summary, and one-click export to CSV or KML.
+A desktop application for visualising flight telemetry from DJI Air 3S `.SRT` subtitle files. Load a flight log to see the GPS track overlaid on a satellite map, with altitude and speed charts, a full flight summary, and one-click export to CSV, KML, or a HUD-overlaid video.
 
 ---
 
@@ -14,6 +14,7 @@ A desktop application for visualising flight telemetry from DJI Air 3S `.SRT` su
 - **Export KML** — GPS track and home point marker for use in any GIS tool
 - **View in Google Maps** — opens a local map in your browser showing the full flight path and markers
 - **View in Google Earth** — exports a styled KML and opens it directly in Google Earth
+- **Export HUD Video** — burns a fixed-width telemetry overlay (altitude, speed, heading, HAG) directly onto the MP4 using Apple VideoToolbox hardware encoding
 
 ---
 
@@ -21,6 +22,7 @@ A desktop application for visualising flight telemetry from DJI Air 3S `.SRT` su
 
 - macOS (Apple Silicon or Intel)
 - Python 3.9+
+- [ffmpeg](https://ffmpeg.org/) — required for HUD video export (`brew install ffmpeg`)
 - Dependencies listed in `.venv` (see [Installation](#installation))
 
 ---
@@ -140,14 +142,79 @@ Both export dialogs let you choose the save location and filename.
 
 ---
 
+## Export HUD Video
+
+Clicking **🎬 Export HUD Video** opens a dialog that burns a telemetry overlay directly onto the original MP4 file, producing a new video with the HUD permanently embedded.
+
+### Workflow
+
+1. Load an `.SRT` file as normal.
+2. Click **🎬 Export HUD Video**.
+3. Click **Browse…** and select the matching `.MP4` file. The SRT is re-parsed at full frame rate in the background (progress bar animates 0 → 50%).
+4. Optionally click **🔍 Refresh Preview** to see a mid-flight frame with the overlay applied.
+5. Adjust settings as needed (see below).
+6. Click **🎬 Export Video**, choose an output filename, and wait. The progress bar animates 50 → 100% as ffmpeg encodes.
+7. A completion dialog offers to reveal the output file in Finder.
+
+### HUD fields
+
+Each field is rendered in a fixed-width format so the text never shifts horizontally as values change during playback.
+
+| Field | Format | Example |
+|---|---|---|
+| **ALT** — Altitude | 4 digits, no decimal, leading zeros blank | `ALT   82m` |
+| **SPD** — Speed | 2 digits, no decimal, capped at 99 | `SPD 30km/h` |
+| **HDG** — Heading | 3 digits + 8-point compass, GPS course | `HDG 247° SW` |
+| **V/S** — Vertical speed | 2 digits with sign | `V/S +2m/s` |
+| **HAG** — Height Above Ground | 4 digits, no decimal | `HAG   45m` |
+
+> **Heading** is the GPS course bearing (direction of travel), not a compass/magnetometer reading. It shows `---` when the drone is stationary.
+
+> **HAG** requires terrain data to have been fetched from Open-Meteo before starting the export. If terrain data is not available, the field shows `---m`.
+
+A typical HUD line looks like:
+
+```
+ALT   82m  SPD 30km/h  HDG 247° SW  HAG   45m
+```
+
+### Settings
+
+| Setting | Options | Description |
+|---|---|---|
+| **Fields** | Checkboxes | Choose which telemetry values to show |
+| **Speed unit** | km/h / m/s | Unit for the SPD field |
+| **Altitude** | Relative / Absolute | Relative = above home point; Absolute = above sea level |
+| **Corner** | Top-left / Top-right / Bottom-left / Bottom-right | Screen position of the overlay |
+| **Margin X / Y** | Pixels | Offset from the chosen corner |
+| **Font size** | Points | Text size in the output video |
+| **Colour** | Hex RGB | Text colour (e.g. `FFFFFF` for white) |
+| **BG opacity** | 0–255 | Transparency of the background box behind the text |
+| **Bold** | Checkbox | Bold text |
+
+All settings are persisted between sessions.
+
+### Encoding
+
+The exporter uses **Apple VideoToolbox** (`h264_videotoolbox`) for hardware-accelerated H.264 encoding at 60 Mbps. On an M2 Pro this runs at approximately 0.85× realtime — a 13-minute 4K 60 fps video encodes in around 15 minutes.
+
+> ffmpeg must be installed and on your `PATH`. Install via Homebrew: `brew install ffmpeg`
+
+### Cancelling
+
+Click **✖ Cancel** during an export to stop encoding immediately. The partial output file is deleted automatically.
+
+---
+
 ## File structure
 
 | File | Purpose |
 |---|---|
 | `srt_viewer.py` | Entry point |
-| `gui.py` | Tkinter UI — layout, charts, toolbar, export actions |
-| `controller.py` | Data layer — parsing, stats, CSV/KML export |
+| `gui.py` | Tkinter UI — layout, charts, toolbar, export actions, HUD dialog |
+| `controller.py` | Data layer — parsing, stats, CSV/KML export, HUD frame building |
 | `srt_parser.py` | SRT file parser and `FlightFrame` data model |
+| `hud_exporter.py` | HUD overlay logic — frame derivation, ASS subtitle generation, ffmpeg encoding |
 | `config.py` | Persistent user preferences (`~/.dji_srt_viewer/config.json`) |
 | `DJI SRT Viewer.spec` | PyInstaller build specification (arm64) |
 | `zip_source.sh` | Script to zip source files for distribution |

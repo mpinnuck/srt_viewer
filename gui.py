@@ -19,6 +19,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os
 import math
+import queue
 import webbrowser
 import tempfile
 import subprocess
@@ -48,7 +49,7 @@ def _ensure_matplotlib():
     _mpl_ready = True
 
 
-APP_VERSION = '1.5.0'
+APP_VERSION = '2.0'
 
 # ---------------------------------------------------------------------------
 # Colour palette
@@ -148,6 +149,7 @@ class GUI:
         ttk.Button(bar, text="🌍  Export KML",  command=self._export_kml).pack(side=tk.LEFT, padx=4)
         ttk.Button(bar, text="🗺️  Google Maps",  command=self._open_google_maps).pack(side=tk.LEFT, padx=4)
         ttk.Button(bar, text="🌐  Google Earth", command=self._open_google_earth).pack(side=tk.LEFT, padx=4)
+        ttk.Button(bar, text="🎬  Export HUD Video", command=self._open_hud_dialog).pack(side=tk.LEFT, padx=4)
 
         # Progress bar (hidden until loading)
         self._progress_var = tk.DoubleVar(value=0)
@@ -239,6 +241,7 @@ class GUI:
         self._spd_placeholder.pack(fill=tk.BOTH, expand=True, padx=4)
 
         self._mpl_ready = False
+        self._draw_gen  = 0     # guards stale BG renders
 
     def _init_mpl_async(self):
         """Show toast, import matplotlib on a background thread, then build canvases."""
@@ -379,9 +382,10 @@ class GUI:
             self._status(f"Loaded  {len(self.controller.frames):,} samples  "
                          f"from  {os.path.basename(self.controller.filepath)}")
             if self._mpl_ready:
-                self._draw_altitude()
-            # if canvases not ready yet, _redraw_all (called when they are created)
-            # will pick up terrain_elevations automatically — no action needed here
+                self._draw_gen += 1
+                threading.Thread(target=self._render_altitude,
+                                 args=(self._draw_gen,), daemon=True).start()
+            # if canvases not ready yet, _redraw_all will pick up terrain automatically
         self.root.after(0, _do)
 
     def _on_terrain_error(self, msg: str):
@@ -391,7 +395,9 @@ class GUI:
                 f"from  {os.path.basename(self.controller.filepath)}"
                 f"  —  terrain unavailable: {msg[:60]}")
             if self._mpl_ready:
-                self._draw_altitude()
+                self._draw_gen += 1
+                threading.Thread(target=self._render_altitude,
+                                 args=(self._draw_gen,), daemon=True).start()
         self.root.after(0, _do)
 
     # ------------------------------------------------------------------
@@ -399,20 +405,32 @@ class GUI:
     # ------------------------------------------------------------------
 
     def _redraw_all(self):
-        self._draw_map()
-        self._draw_altitude()
-        self._draw_speed()
+        """Dispatch chart renders to background threads.
+
+        matplotlib axes operations run on daemon threads; only canvas.draw()
+        (the Agg→Tk blit) is marshalled back to the UI thread via after(0).
+        _draw_gen discards stale renders if a newer redraw has started.
+        """
+        self._draw_gen += 1
+        gen = self._draw_gen
+        threading.Thread(target=self._render_map,      args=(gen,), daemon=True).start()
+        threading.Thread(target=self._render_altitude, args=(gen,), daemon=True).start()
+        threading.Thread(target=self._render_speed,    args=(gen,), daemon=True).start()
         self._draw_summary()
+
 
     def _redraw_charts(self):
         if not self.controller.loaded:
             return
         self.config.set('alt_type', self._alt_var.get())
-        self._draw_altitude()
+        self._draw_gen += 1
+        gen = self._draw_gen
+        threading.Thread(target=self._render_altitude, args=(gen,), daemon=True).start()
 
     # ---- Map ----------------------------------------------------------
 
-    def _draw_map(self):
+    def _render_map(self, gen: int):
+        """Render map on BG thread; schedule canvas.draw() on UI thread."""
         import matplotlib.pyplot as plt
         ax = self._map_ax
         ax.clear()
@@ -460,7 +478,8 @@ class GUI:
         ax.set_aspect('equal', adjustable='datalim')
 
         self._map_fig.tight_layout(pad=0.5)
-        self._map_canvas.draw()
+        if gen == self._draw_gen:
+            self.root.after(0, self._map_canvas.draw)
 
         # Fetch satellite tiles in background; composite when ready
         self._tile_generation += 1
@@ -543,7 +562,8 @@ class GUI:
 
     # ---- Altitude chart -----------------------------------------------
 
-    def _draw_altitude(self):
+    def _render_altitude(self, gen: int):
+        """Render altitude chart on BG thread."""
         ax = self._alt_ax
         ax.clear()
         self._style_ax(ax)
@@ -590,11 +610,13 @@ class GUI:
         self._alt_fig.tight_layout(pad=0.5, rect=[0, 0, 0.95, 1])
         if hags:
             ax2.set_ylim(ax.get_ylim())   # sync AFTER layout is finalised
-        self._alt_canvas.draw()
+        if gen == self._draw_gen:
+            self.root.after(0, self._alt_canvas.draw)
 
     # ---- Speed chart --------------------------------------------------
 
-    def _draw_speed(self):
+    def _render_speed(self, gen: int):
+        """Render speed chart on BG thread."""
         ax = self._spd_ax
         ax.clear()
         self._style_ax(ax)
@@ -611,7 +633,8 @@ class GUI:
         ax.set_xlabel('Time (min)', color=SUBTEXT, fontsize=7)
 
         self._spd_fig.tight_layout(pad=0.5)
-        self._spd_canvas.draw()
+        if gen == self._draw_gen:
+            self.root.after(0, self._spd_canvas.draw)
 
     # ---- Summary text -------------------------------------------------
 
@@ -737,3 +760,565 @@ L.circleMarker(coords[coords.length-1],{{radius:8,color:'#f38ba8',fillColor:'#f3
         self.config.set('alt_type', self._alt_var.get())
         self.config.save()
         self.root.destroy()
+
+
+    # ------------------------------------------------------------------
+    # HUD Export Dialog
+    # ------------------------------------------------------------------
+
+    def _open_hud_dialog(self):
+        if not self.controller.loaded:
+            messagebox.showinfo('HUD Export', 'Load an SRT file first.')
+            return
+        HudExportDialog(self.root, self.config, self.controller)
+
+
+class HudExportDialog(tk.Toplevel):
+    """Modal-style dialog for configuring and running HUD video export.
+
+    Layout
+    ------
+    Left column : settings (fields, position, style)
+    Right column: preview canvas  + progress / action buttons
+    """
+
+    _CORNERS = [('Top-left', 'tl'), ('Top-right', 'tr'),
+                ('Bottom-left', 'bl'), ('Bottom-right', 'br')]
+
+    def __init__(self, parent, config: 'Config', controller: 'Controller'):
+        super().__init__(parent)
+        self._root      = parent            # root Tk window
+        self._ui_queue  = queue.SimpleQueue()  # background threads post UI events here
+        self._polling   = True
+        self.config     = config
+        self.controller = controller
+
+        self.title('Export HUD Video')
+        self.configure(bg=BG)
+        self.resizable(True, True)
+
+        # Centre over parent
+        pw = parent.winfo_width()
+        ph = parent.winfo_height()
+        px = parent.winfo_rootx()
+        py = parent.winfo_rooty()
+        dw, dh = 1020, 660
+        self.geometry(f'{dw}x{dh}+{px + (pw - dw)//2}+{py + (ph - dh)//2}')
+
+        # State
+        self._mp4_path    = tk.StringVar()
+        self._parse_done  = False
+        self._exporting   = False
+        self._preview_img = None   # numpy array
+
+        # Tkinter vars for settings
+        self._show_alt   = tk.BooleanVar(value=bool(config.get('hud_show_altitude', True)))
+        self._show_spd   = tk.BooleanVar(value=bool(config.get('hud_show_speed', True)))
+        self._show_hdg   = tk.BooleanVar(value=bool(config.get('hud_show_heading', True)))
+        self._show_vs    = tk.BooleanVar(value=bool(config.get('hud_show_vspeed', False)))
+        self._show_hag   = tk.BooleanVar(value=bool(config.get('hud_show_hag', False)))
+        self._speed_unit = tk.StringVar(value=config.get('hud_speed_unit', 'kmh'))
+        self._alt_type   = tk.StringVar(value=config.get('hud_alt_type', 'rel'))
+        self._corner     = tk.StringVar(value=config.get('hud_corner', 'tl'))
+        self._margin_x   = tk.IntVar(value=int(config.get('hud_margin_x', 30)))
+        self._margin_y   = tk.IntVar(value=int(config.get('hud_margin_y', 30)))
+        self._font_size  = tk.IntVar(value=int(config.get('hud_font_size', 22)))
+        self._font_col   = tk.StringVar(value=config.get('hud_font_colour', 'FFFFFF'))
+        self._bg_alpha   = tk.IntVar(value=int(config.get('hud_bg_alpha', 140)))
+        self._bold       = tk.BooleanVar(value=bool(config.get('hud_bold', True)))
+
+        self._progress_var = tk.DoubleVar(value=0)
+        self._status_var   = tk.StringVar(value='Select the matching MP4 file to begin.')
+
+        # Wire controller HUD callbacks
+        controller.on_hud_parse_progress  = self._on_parse_progress
+        controller.on_hud_parse_complete  = self._on_parse_complete
+        controller.on_hud_export_progress = self._on_export_progress
+        controller.on_hud_export_complete = self._on_export_complete
+        controller.on_hud_export_error    = self._on_export_error
+
+        self._build_ui()
+        self.grab_set()   # make modal
+        self.focus_set()
+        self.protocol('WM_DELETE_WINDOW', self._on_close)
+        self.after(100, self._poll_ui)   # start background-event polling
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        # Pack bottom FIRST so it gets space before outer expands
+        bottom = tk.Frame(self, bg=BG, padx=10, pady=4)
+        bottom.pack(fill=tk.X, side=tk.BOTTOM)
+        tk.Label(bottom, textvariable=self._status_var,
+                 fg=SUBTEXT, bg=BG, font=('SF Mono', 9)
+                 ).pack(anchor=tk.W)
+        self._pbar = tk.Canvas(bottom, height=26, bg=BG2,
+                               highlightthickness=1,
+                               highlightbackground=GRID)
+        self._pbar.pack(fill=tk.X, pady=(3, 0))
+        self._pbar_pct = 0.0
+        self._pbar.bind('<Configure>', lambda e: self._redraw_pbar())
+
+        # ---- outer two-column layout (packed after bottom so it fills remaining space) ----
+        outer = ttk.Frame(self, style='TFrame', padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+        outer.columnconfigure(0, weight=0, minsize=310)
+        outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(0, weight=1)
+
+        left  = ttk.Frame(outer, style='TFrame')
+        left.grid(row=0, column=0, sticky='nsew', padx=(0, 10))
+        right = ttk.Frame(outer, style='TFrame')
+        right.grid(row=0, column=1, sticky='nsew')
+        right.rowconfigure(1, weight=1)
+
+        self._build_left(left)
+        self._build_right(right)
+
+    def _redraw_pbar(self):
+        c = self._pbar
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w < 2:
+            return
+        c.delete('all')
+        # trough
+        c.create_rectangle(0, 0, w, h, fill=BG2, outline='')
+        # fill
+        fw = int(w * self._pbar_pct / 100)
+        if fw > 0:
+            c.create_rectangle(0, 0, fw, h, fill=ACCENT, outline='')
+        # label
+        if self._pbar_pct > 0:
+            c.create_text(w // 2, h // 2,
+                          text=f'{self._pbar_pct:.0f}%',
+                          fill=TEXT, font=('SF Mono', 14))
+
+    def _set_pbar(self, pct: float):
+        self._pbar_pct = max(0.0, min(100.0, pct))
+        self._redraw_pbar()
+
+    def _section(self, parent, label: str) -> ttk.Frame:
+        """Returns a labelled LabelFrame-style container."""
+        lf = tk.LabelFrame(parent, text=label,
+                           bg=BG, fg=ACCENT,
+                           font=('SF Pro Display', 9, 'bold'),
+                           relief='flat', bd=1,
+                           highlightbackground=GRID,
+                           highlightthickness=1,
+                           padx=8, pady=6)
+        lf.pack(fill=tk.X, pady=(0, 8))
+        return lf
+
+    def _row(self, parent, label: str, widget_factory):
+        """Two-column label + widget row."""
+        f = ttk.Frame(parent, style='TFrame')
+        f.pack(fill=tk.X, pady=2)
+        ttk.Label(f, text=label, width=16, anchor='w').pack(side=tk.LEFT)
+        widget_factory(f).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+    def _build_left(self, parent):
+        # ---- MP4 source ----
+        mp4_sec = self._section(parent, 'Source MP4')
+        mp4_frame = ttk.Frame(mp4_sec, style='TFrame')
+        mp4_frame.pack(fill=tk.X)
+        self._mp4_entry = ttk.Entry(mp4_frame, textvariable=self._mp4_path,
+                                    font=('SF Mono', 9))
+        self._mp4_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+        ttk.Button(mp4_frame, text='Browse…',
+                   command=self._browse_mp4).pack(side=tk.LEFT)
+
+        # ---- Fields ----
+        fld = self._section(parent, 'HUD Fields')
+        ttk.Checkbutton(fld, text='Altitude', variable=self._show_alt,
+                        command=self._settings_changed).pack(anchor='w')
+        ttk.Checkbutton(fld, text='Speed', variable=self._show_spd,
+                        command=self._settings_changed).pack(anchor='w')
+        ttk.Checkbutton(fld, text='Heading (GPS course)', variable=self._show_hdg,
+                        command=self._settings_changed).pack(anchor='w')
+        ttk.Checkbutton(fld, text='Vertical speed', variable=self._show_vs,
+                        command=self._settings_changed).pack(anchor='w')
+        self._hag_cb = ttk.Checkbutton(fld, text='HAG (requires terrain data)',
+                                        variable=self._show_hag,
+                                        command=self._settings_changed)
+        self._hag_cb.pack(anchor='w')
+
+        # ---- Units ----
+        units = self._section(parent, 'Units')
+        uf = ttk.Frame(units, style='TFrame')
+        uf.pack(fill=tk.X)
+        ttk.Label(uf, text='Speed:').pack(side=tk.LEFT)
+        ttk.Radiobutton(uf, text='km/h', variable=self._speed_unit,
+                        value='kmh', command=self._settings_changed).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(uf, text='m/s', variable=self._speed_unit,
+                        value='ms', command=self._settings_changed).pack(side=tk.LEFT)
+        af = ttk.Frame(units, style='TFrame')
+        af.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(af, text='Altitude:').pack(side=tk.LEFT)
+        ttk.Radiobutton(af, text='Relative', variable=self._alt_type,
+                        value='rel', command=self._settings_changed).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(af, text='Absolute', variable=self._alt_type,
+                        value='abs', command=self._settings_changed).pack(side=tk.LEFT)
+
+        # ---- Position ----
+        pos = self._section(parent, 'Position')
+        cf = ttk.Frame(pos, style='TFrame')
+        cf.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(cf, text='Corner:', width=10, anchor='w').pack(side=tk.LEFT)
+        for label, val in self._CORNERS:
+            ttk.Radiobutton(cf, text=label, variable=self._corner,
+                            value=val, command=self._settings_changed).pack(side=tk.LEFT, padx=3)
+
+        def _spin_row(parent, label, var):
+            f = ttk.Frame(parent, style='TFrame')
+            f.pack(fill=tk.X, pady=2)
+            ttk.Label(f, text=label, width=14, anchor='w').pack(side=tk.LEFT)
+            sb = tk.Spinbox(f, from_=0, to=500, textvariable=var, width=6,
+                            bg=BG2, fg=TEXT, insertbackground=TEXT,
+                            buttonbackground=BG2, relief='flat',
+                            command=self._settings_changed)
+            sb.pack(side=tk.LEFT)
+            sb.bind('<Return>', lambda _: self._settings_changed())
+
+        _spin_row(pos, 'Margin X (px):', self._margin_x)
+        _spin_row(pos, 'Margin Y (px):', self._margin_y)
+
+        # ---- Style ----
+        sty = self._section(parent, 'Style')
+        _spin_row(sty, 'Font size (pt):', self._font_size)
+
+        col_f = ttk.Frame(sty, style='TFrame')
+        col_f.pack(fill=tk.X, pady=2)
+        ttk.Label(col_f, text='Colour (hex):', width=14, anchor='w').pack(side=tk.LEFT)
+        col_entry = ttk.Entry(col_f, textvariable=self._font_col, width=8,
+                              font=('SF Mono', 10))
+        col_entry.pack(side=tk.LEFT)
+        col_entry.bind('<Return>', lambda _: self._settings_changed())
+
+        _spin_row(sty, 'BG opacity:', self._bg_alpha)
+        ttk.Checkbutton(sty, text='Bold', variable=self._bold,
+                        command=self._settings_changed).pack(anchor='w', pady=2)
+
+    def _build_right(self, parent):
+        ttk.Label(parent, text='PREVIEW', foreground=ACCENT,
+                  font=('SF Pro Display', 9, 'bold')
+                  ).grid(row=0, column=0, sticky='w', pady=(0, 4))
+
+        # Preview canvas
+        self._preview_frame = tk.Frame(parent, bg=BG2, relief='flat')
+        self._preview_frame.grid(row=1, column=0, sticky='nsew')
+        parent.rowconfigure(1, weight=1)
+        parent.columnconfigure(0, weight=1)
+
+        self._preview_label = tk.Label(self._preview_frame,
+                                       text='Preview will appear here\nafter selecting an MP4.',
+                                       bg=BG2, fg=SUBTEXT,
+                                       font=('SF Pro Display', 11))
+        self._preview_label.place(relx=0.5, rely=0.5, anchor='center')
+
+        # Buttons
+        btn_frame = ttk.Frame(parent, style='TFrame')
+        btn_frame.grid(row=2, column=0, pady=(8, 0), sticky='ew')
+        btn_frame.columnconfigure(0, weight=1)
+        btn_frame.columnconfigure(1, weight=1)
+        btn_frame.columnconfigure(2, weight=1)
+
+        self._btn_preview = ttk.Button(btn_frame, text='🔍  Refresh Preview',
+                                        command=self._refresh_preview)
+        self._btn_preview.grid(row=0, column=0, padx=4, sticky='ew')
+
+        self._btn_export = ttk.Button(btn_frame, text='🎬  Export Video',
+                                       command=self._start_export)
+        self._btn_export.grid(row=0, column=1, padx=4, sticky='ew')
+
+        self._btn_cancel = ttk.Button(btn_frame, text='✖  Cancel',
+                                       command=self._on_close, state='normal')
+        self._btn_cancel.grid(row=0, column=2, padx=4, sticky='ew')
+
+    # ------------------------------------------------------------------
+    # MP4 browse
+    # ------------------------------------------------------------------
+
+    def _browse_mp4(self):
+        init = self.config.get('hud_last_mp4_dir', '') or \
+               self.config.get('last_srt_dir', os.path.expanduser('~'))
+        path = filedialog.askopenfilename(
+            parent=self,
+            title='Select matching MP4',
+            initialdir=init,
+            filetypes=[('MP4 files', '*.mp4 *.MP4'), ('All files', '*.*')]
+        )
+        if not path:
+            return
+        self._mp4_path.set(path)
+        self.config.set('hud_last_mp4_dir', os.path.dirname(path))
+        self._status('Parsing SRT at full resolution — this may take a moment…')
+        self._btn_export.config(state='disabled')
+        self._btn_preview.config(state='disabled')
+        # Restart poll loop — native open dialog suspends Tk's after() chain
+        self._polling = True
+        self.after(100, self._poll_ui)
+        self.controller.build_hud_frames_async()
+
+    # ------------------------------------------------------------------
+    # Settings changed → invalidate preview
+    # ------------------------------------------------------------------
+
+    def _settings_changed(self):
+        if self._parse_done:
+            self._preview_label.config(text='Settings changed.\nClick Refresh Preview.')
+            if hasattr(self, '_prev_img_label'):
+                self._prev_img_label.destroy()
+                del self._prev_img_label
+
+    # ------------------------------------------------------------------
+    # Preview rendering
+    # ------------------------------------------------------------------
+
+    def _refresh_preview(self):
+        mp4 = self._mp4_path.get()
+        if not mp4 or not os.path.isfile(mp4):
+            messagebox.showwarning('Preview', 'Select a valid MP4 file first.',
+                                   parent=self)
+            return
+        if not self._parse_done:
+            messagebox.showwarning('Preview', 'Wait for SRT parsing to finish.',
+                                   parent=self)
+            return
+        self._status('Rendering preview…')
+        cfg = self._make_hud_config()
+        threading.Thread(target=self._preview_worker,
+                         args=(mp4, cfg), daemon=True).start()
+
+    def _preview_worker(self, mp4: str, cfg):
+        arr = self.controller.get_preview_frame(mp4, cfg, target_w=640)
+        self._ui_queue.put(('preview', arr))
+
+    def _show_preview(self, arr):
+        if arr is None:
+            self._status('Preview failed — check MP4 path and ffmpeg.')
+            return
+        try:
+            from PIL import Image, ImageTk
+            img   = Image.fromarray(arr)
+            ph_w  = max(200, self._preview_frame.winfo_width())
+            ph_h  = max(150, self._preview_frame.winfo_height())
+            scale = min(ph_w / img.width, ph_h / img.height, 1.0)
+            nw    = max(1, int(img.width  * scale))
+            nh    = max(1, int(img.height * scale))
+            img   = img.resize((nw, nh), Image.LANCZOS)
+            tk_img = ImageTk.PhotoImage(img)
+
+            # Remove old label/image if present
+            if hasattr(self, '_prev_img_label'):
+                self._prev_img_label.destroy()
+            self._preview_label.place_forget()
+
+            self._prev_img_label = tk.Label(self._preview_frame,
+                                            image=tk_img, bg=BG2)
+            self._prev_img_label.image = tk_img   # keep reference
+            self._prev_img_label.place(relx=0.5, rely=0.5, anchor='center')
+            self._status('Preview updated.')
+        except Exception as e:
+            self._status(f'Preview error: {e}')
+
+    # ------------------------------------------------------------------
+    # Export
+    # ------------------------------------------------------------------
+
+    def _make_hud_config(self):
+        from hud_exporter import HudConfig
+        return HudConfig(
+            show_altitude = self._show_alt.get(),
+            show_speed    = self._show_spd.get(),
+            show_heading  = self._show_hdg.get(),
+            show_vspeed   = self._show_vs.get(),
+            show_hag      = self._show_hag.get(),
+            speed_unit    = self._speed_unit.get(),
+            alt_type      = self._alt_type.get(),
+            corner        = self._corner.get(),
+            margin_x      = self._margin_x.get(),
+            margin_y      = self._margin_y.get(),
+            font_size     = self._font_size.get(),
+            font_colour   = self._font_col.get().lstrip('#').upper() or 'FFFFFF',
+            bg_alpha      = max(0, min(255, self._bg_alpha.get())),
+            bold          = self._bold.get(),
+        )
+
+    def _start_export(self):
+        mp4 = self._mp4_path.get()
+        if not mp4 or not os.path.isfile(mp4):
+            messagebox.showwarning('Export', 'Select a valid MP4 file first.',
+                                   parent=self)
+            return
+        if not self._parse_done:
+            messagebox.showwarning('Export',
+                                   'Wait for SRT parsing to complete.',
+                                   parent=self)
+            return
+        if self._exporting:
+            return
+
+        base = os.path.splitext(mp4)[0]
+        out_path = filedialog.asksaveasfilename(
+            parent=self,
+            title='Save HUD Video',
+            initialfile=os.path.basename(base) + '_hud.mp4',
+            defaultextension='.mp4',
+            filetypes=[('MP4 files', '*.mp4')]
+        )
+        if not out_path:
+            return
+
+        self._exporting = True
+        self._btn_export.config(state='disabled')
+        self._btn_preview.config(state='disabled')
+        self._status('Exporting — ffmpeg encoding…')
+        self._set_pbar(0)
+        self._save_settings()
+        cfg = self._make_hud_config()
+        # Restart the poll loop — macOS native save panel suspends Tk's event
+        # loop while open, so the after() chain started in __init__ stops ticking.
+        self._polling = True
+        self.after(100, self._poll_ui)
+        self.controller.export_hud_video(mp4, out_path, cfg)
+
+    # ------------------------------------------------------------------
+    # Controller callbacks (fire on background thread → post to queue)
+    # ------------------------------------------------------------------
+
+    def _on_parse_progress(self, pct: float):
+        self._ui_queue.put(('status', f'Parsing SRT… {pct:.0f}%'))
+
+    def _on_parse_complete(self):
+        self._ui_queue.put(('parse_complete', len(self.controller.hud_frames)))
+
+    def _on_export_progress(self, pct: float):
+        self._ui_queue.put(('progress', pct))
+
+    def _on_export_complete(self, out_path: str):
+        self._ui_queue.put(('export_complete', out_path))
+
+    def _on_export_error(self, msg: str):
+        self._ui_queue.put(('export_error', msg))
+
+    # ------------------------------------------------------------------
+    # Main-thread UI event pump (called every 100 ms via root.after)
+    # ------------------------------------------------------------------
+
+    def _poll_ui(self):
+        try:
+            while True:
+                event, *args = self._ui_queue.get_nowait()
+                if event == 'progress':
+                    self._set_pbar(args[0])
+                elif event == 'status':
+                    self._status_var.set(args[0])
+                elif event == 'parse_complete':
+                    n = args[0]
+                    self._parse_done = True
+                    self._status_var.set(f'Parsed {n:,} frames.  '
+                                         'Click Refresh Preview, then Export Video.')
+                    self._btn_preview.config(state='normal')
+                    self._btn_export.config(state='normal')
+                    if self._mp4_path.get() and os.path.isfile(self._mp4_path.get()):
+                        self._refresh_preview()
+                elif event == 'export_complete':
+                    out_path = args[0]
+                    self._exporting = False
+                    self._set_pbar(100)
+                    self._btn_export.config(state='normal')
+                    self._btn_preview.config(state='normal')
+                    self._status_var.set(f'Done! → {os.path.basename(out_path)}')
+                    if messagebox.askyesno(
+                        'Export Complete',
+                        f'HUD video saved:\n{out_path}\n\nOpen in Finder/Explorer?',
+                        parent=self,
+                    ):
+                        _reveal_in_finder(out_path)
+                elif event == 'export_error':
+                    msg = args[0]
+                    self._exporting = False
+                    self._btn_export.config(state='normal')
+                    self._btn_preview.config(state='normal')
+                    self._btn_cancel.config(state='normal')
+                    if 'cancelled' in msg.lower():
+                        self._status_var.set(
+                            'Export cancelled.  Close the dialog or start a new export.')
+                    else:
+                        self._status_var.set(f'Error: {msg[:100]}')
+                        messagebox.showerror('Export Error', msg, parent=self)
+                elif event == 'preview':
+                    self._show_preview(args[0])
+        except queue.Empty:
+            pass
+        if self._polling:
+            self.after(100, self._poll_ui)
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _status(self, msg: str):
+        self._status_var.set(msg)
+
+    def _save_settings(self):
+        c = self.config
+        c.set('hud_show_altitude', self._show_alt.get())
+        c.set('hud_show_speed',    self._show_spd.get())
+        c.set('hud_show_heading',  self._show_hdg.get())
+        c.set('hud_show_vspeed',   self._show_vs.get())
+        c.set('hud_show_hag',      self._show_hag.get())
+        c.set('hud_speed_unit',    self._speed_unit.get())
+        c.set('hud_alt_type',      self._alt_type.get())
+        c.set('hud_corner',        self._corner.get())
+        c.set('hud_margin_x',      self._margin_x.get())
+        c.set('hud_margin_y',      self._margin_y.get())
+        c.set('hud_font_size',     self._font_size.get())
+        c.set('hud_font_colour',   self._font_col.get().lstrip('#').upper() or 'FFFFFF')
+        c.set('hud_bg_alpha',      self._bg_alpha.get())
+        c.set('hud_bold',          self._bold.get())
+        c.save()
+
+    def _on_close(self):
+        if self._exporting:
+            if not messagebox.askyesno(
+                'Cancel Export?',
+                'Export is in progress.  Cancel it?',
+                parent=self,
+            ):
+                return
+            # Signal ffmpeg to die, then update UI immediately so the user
+            # sees feedback — the worker thread cleans up asynchronously.
+            self._status('Cancelling…')
+            self._btn_cancel.config(state='disabled')
+            self._btn_export.config(state='disabled')
+            self.controller.cancel_hud_export()
+            # Do NOT destroy here — let _on_export_error fire and reset
+            # state first, then the user can close normally.
+            return
+
+        self._polling = False   # stop the poll loop
+        self._save_settings()
+        self.controller.on_hud_parse_progress  = None
+        self.controller.on_hud_parse_complete  = None
+        self.controller.on_hud_export_progress = None
+        self.controller.on_hud_export_complete = None
+        self.controller.on_hud_export_error    = None
+        self.destroy()
+
+
+def _reveal_in_finder(path: str):
+    """Open Finder/Explorer to show the exported file."""
+    sys = platform.system()
+    try:
+        if sys == 'Darwin':
+            subprocess.Popen(['open', '-R', path])
+        elif sys == 'Windows':
+            subprocess.Popen(['explorer', '/select,', path])
+        else:
+            subprocess.Popen(['xdg-open', os.path.dirname(path)])
+    except Exception:
+        pass

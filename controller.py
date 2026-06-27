@@ -31,6 +31,10 @@ from typing import List, Optional, Callable
 
 from srt_parser import SRTParser, FlightFrame
 from config import Config
+from hud_exporter import (
+    HudConfig,
+    build_hud_frames, write_ass, burn_hud, probe_video, render_preview_frame,
+)
 
 
 class Controller:
@@ -55,6 +59,15 @@ class Controller:
         self.on_load_error:     Optional[Callable[[str], None]]   = None
         self.on_terrain_ready:  Optional[Callable[[], None]]      = None
         self.on_terrain_error:  Optional[Callable[[str], None]]   = None
+
+        # HUD export state
+        self.hud_frames: list = []
+        self.hud_cancel = threading.Event()
+        self.on_hud_parse_progress:  Optional[Callable[[float], None]] = None
+        self.on_hud_parse_complete:  Optional[Callable[[], None]]      = None
+        self.on_hud_export_progress: Optional[Callable[[float], None]] = None
+        self.on_hud_export_complete: Optional[Callable[[str],  None]]  = None
+        self.on_hud_export_error:    Optional[Callable[[str],  None]]  = None
 
     # ------------------------------------------------------------------
     # File loading (async)
@@ -249,3 +262,95 @@ class Controller:
             f.write('  <Placemark><name>Home</name><styleUrl>#home</styleUrl>\n')
             f.write(f'    <Point><coordinates>{home.longitude:.6f},{home.latitude:.6f},0</coordinates></Point>\n')
             f.write('  </Placemark>\n</Document>\n</kml>\n')
+
+
+    # ------------------------------------------------------------------
+    # HUD export
+    # ------------------------------------------------------------------
+
+    def build_hud_frames_async(self):
+        """Re-parse SRT at stride=1 in background to get full-res HUD data."""
+        if not self.filepath:
+            return
+        self.hud_frames = []
+        thread = threading.Thread(target=self._hud_parse_worker, daemon=True)
+        thread.start()
+
+    def _hud_parse_worker(self):
+        try:
+            self.hud_frames = build_hud_frames(
+                self.filepath,
+                progress_cb=self.on_hud_parse_progress,
+                terrain_elevations=self.terrain_elevations,
+            )
+            if self.on_hud_parse_complete:
+                self.on_hud_parse_complete()
+        except Exception as e:
+            if self.on_hud_export_error:
+                import subprocess as _sp
+                if isinstance(e, _sp.CalledProcessError) and e.stderr:
+                    self.on_hud_export_error(f'{e}\n\nffmpeg output:\n{e.stderr[-2000:]}')
+                else:
+                    self.on_hud_export_error(str(e))
+
+    def export_hud_video(self, mp4_path: str, out_path: str, hud_cfg: HudConfig):
+        """Burn HUD overlay into mp4_path → out_path in a background thread."""
+        self.hud_cancel.clear()
+        thread = threading.Thread(
+            target=self._hud_export_worker,
+            args=(mp4_path, out_path, hud_cfg),
+            daemon=True,
+        )
+        thread.start()
+
+    def _hud_export_worker(self, mp4_path: str, out_path: str, hud_cfg: HudConfig):
+        try:
+            # Probe video dimensions for correct ASS PlayResX/Y
+            vid_w, vid_h, _ = probe_video(mp4_path)
+
+            # Write temporary ASS file
+            fd, ass_path = __import__('tempfile').mkstemp(suffix='.ass',
+                                                           prefix='dji_hud_')
+            __import__('os').close(fd)
+            try:
+                write_ass(self.hud_frames, hud_cfg, ass_path, vid_w, vid_h)
+                burn_hud(
+                    mp4_path, ass_path, out_path,
+                    progress_cb=self.on_hud_export_progress,
+                    cancel_event=self.hud_cancel,
+                    total_frames=len(self.hud_frames) or None,
+                )
+            finally:
+                try:
+                    __import__('os').unlink(ass_path)
+                except OSError:
+                    pass
+
+            if self.on_hud_export_complete:
+                self.on_hud_export_complete(out_path)
+        except Exception as e:
+            import sys, subprocess as _sp
+            stderr_detail = ''
+            if isinstance(e, _sp.CalledProcessError) and e.stderr:
+                stderr_detail = e.stderr[-3000:]
+            print(f'[hud export] EXCEPTION: {type(e).__name__}: {e}', file=sys.stderr)
+            if stderr_detail:
+                print(f'[hud export] ffmpeg stderr:\n{stderr_detail}', file=sys.stderr)
+            if self.on_hud_export_error:
+                msg = str(e)
+                if stderr_detail:
+                    msg += f'\n\nffmpeg output:\n{stderr_detail}'
+                self.on_hud_export_error(msg)
+
+    def cancel_hud_export(self):
+        """Signal the running ffmpeg process to stop."""
+        self.hud_cancel.set()
+
+    def get_preview_frame(self, mp4_path: str, hud_cfg: HudConfig,
+                           target_w: int = 800):
+        """Return a numpy image array for the HUD preview (midpoint frame)."""
+        if not self.hud_frames:
+            return None
+        mid = self.hud_frames[len(self.hud_frames) // 2]
+        return render_preview_frame(mp4_path, mid, hud_cfg, target_w)
+    

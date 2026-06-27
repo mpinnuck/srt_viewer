@@ -16,6 +16,23 @@ _DEFAULT_CONFIG = {
     "speed_unit":      "kmh",     # "kmh" or "ms"
     "alt_type":        "rel",     # "rel" or "abs"
     "theme":           "dark",
+
+    # HUD export settings
+    "hud_show_altitude":  True,
+    "hud_show_speed":     True,
+    "hud_show_heading":   True,
+    "hud_show_vspeed":    False,
+    "hud_show_hag":       False,
+    "hud_speed_unit":     "kmh",
+    "hud_alt_type":       "rel",
+    "hud_corner":         "tl",
+    "hud_margin_x":       30,
+    "hud_margin_y":       30,
+    "hud_font_size":      22,
+    "hud_font_colour":    "FFFFFF",
+    "hud_bg_alpha":       140,
+    "hud_bold":           True,
+    "hud_last_mp4_dir":   "",
 }
 
 _CONFIG_PATH = Path.home() / ".dji_srt_viewer" / "config.json"
