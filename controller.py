@@ -293,17 +293,17 @@ class Controller:
                 else:
                     self.on_hud_export_error(str(e))
 
-    def export_hud_video(self, mp4_path: str, out_path: str, hud_cfg: HudConfig):
+    def export_hud_video(self, mp4_path: str, out_path: str, hud_cfg: HudConfig, quality: str = 'hq'):
         """Burn HUD overlay into mp4_path → out_path in a background thread."""
         self.hud_cancel.clear()
         thread = threading.Thread(
             target=self._hud_export_worker,
-            args=(mp4_path, out_path, hud_cfg),
+            args=(mp4_path, out_path, hud_cfg, quality),
             daemon=True,
         )
         thread.start()
 
-    def _hud_export_worker(self, mp4_path: str, out_path: str, hud_cfg: HudConfig):
+    def _hud_export_worker(self, mp4_path: str, out_path: str, hud_cfg: HudConfig, quality: str = 'hq'):
         try:
             # Probe video dimensions for correct ASS PlayResX/Y
             vid_w, vid_h, _ = probe_video(mp4_path)
@@ -319,6 +319,7 @@ class Controller:
                     progress_cb=self.on_hud_export_progress,
                     cancel_event=self.hud_cancel,
                     total_frames=len(self.hud_frames) or None,
+                    quality=quality,
                 )
             finally:
                 try:
@@ -330,17 +331,16 @@ class Controller:
                 self.on_hud_export_complete(out_path)
         except Exception as e:
             import sys, subprocess as _sp
-            stderr_detail = ''
-            if isinstance(e, _sp.CalledProcessError) and e.stderr:
-                stderr_detail = e.stderr[-3000:]
-            print(f'[hud export] EXCEPTION: {type(e).__name__}: {e}', file=sys.stderr)
-            if stderr_detail:
-                print(f'[hud export] ffmpeg stderr:\n{stderr_detail}', file=sys.stderr)
-            if self.on_hud_export_error:
-                msg = str(e)
+            # Suppress noisy print for normal cancellation
+            if not isinstance(e, RuntimeError) or 'cancelled' not in str(e).lower():
+                stderr_detail = ''
+                if isinstance(e, _sp.CalledProcessError) and e.stderr:
+                    stderr_detail = e.stderr[-3000:]
+                print(f'[hud export] EXCEPTION: {type(e).__name__}: {e}', file=sys.stderr)
                 if stderr_detail:
-                    msg += f'\n\nffmpeg output:\n{stderr_detail}'
-                self.on_hud_export_error(msg)
+                    print(f'[hud export] ffmpeg stderr:\n{stderr_detail}', file=sys.stderr)
+            if self.on_hud_export_error:
+                self.on_hud_export_error(str(e))
 
     def cancel_hud_export(self):
         """Signal the running ffmpeg process to stop."""
@@ -353,4 +353,3 @@ class Controller:
             return None
         mid = self.hud_frames[len(self.hud_frames) // 2]
         return render_preview_frame(mp4_path, mid, hud_cfg, target_w)
-    

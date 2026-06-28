@@ -32,6 +32,7 @@ _DEFAULT_CONFIG = {
     "hud_font_colour":    "FFFFFF",
     "hud_bg_alpha":       140,
     "hud_bold":           True,
+    "hud_quality":        "hq",
     "hud_last_mp4_dir":   "",
 }
 

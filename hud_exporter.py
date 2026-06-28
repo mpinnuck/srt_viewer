@@ -166,6 +166,44 @@ def build_hud_frames(srt_path: str,
     return hud
 
 
+def probe_video_full(mp4_path: str):
+    """Return (w, h, duration_s, codec, bitrate_kbps, pix_fmt) for an MP4."""
+    import json
+
+    def _parse_dur(val):
+        if val is None: return 0.0
+        s = str(val)
+        if '/' in s:
+            n, d = s.split('/', 1)
+            return float(n) / float(d) if float(d) else 0.0
+        try: return float(s)
+        except ValueError: return 0.0
+
+    cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+           '-show_streams', '-show_format', mp4_path]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        return 3840, 2160, 0.0, 'hevc', 71000, 'yuv420p10le'
+    try:
+        data = json.loads(result.stdout)
+    except Exception:
+        return 3840, 2160, 0.0, 'hevc', 71000, 'yuv420p10le'
+
+    w, h, dur, codec, bps, pix = 3840, 2160, 0.0, 'hevc', 71000, 'yuv420p10le'
+    for stream in data.get('streams', []):
+        if stream.get('codec_type') == 'video':
+            w       = int(stream.get('width',  3840))
+            h       = int(stream.get('height', 2160))
+            dur     = _parse_dur(stream.get('duration'))
+            codec   = stream.get('codec_name', 'hevc')
+            bps     = int(stream.get('bit_rate', 71_000_000)) // 1000
+            pix     = stream.get('pix_fmt', 'yuv420p10le')
+            break
+    if dur <= 0.0:
+        dur = _parse_dur(data.get('format', {}).get('duration'))
+    return w, h, dur, codec, bps, pix
+
+
 # ---------------------------------------------------------------------------
 # ASS subtitle generation
 # ---------------------------------------------------------------------------
@@ -342,6 +380,7 @@ def burn_hud(
     progress_cb: Optional[Callable[[float], None]] = None,
     cancel_event: Optional[threading.Event] = None,
     total_frames: Optional[int] = None,
+    quality: str = 'hq',
 ) -> None:
     """Run ffmpeg to burn ASS subtitles into the video.
 
@@ -371,18 +410,40 @@ def burn_hud(
     else:
         safe_ass = ass_path  # temp path is always safe on macOS/Linux
 
-    vf_filter = f'subtitles={safe_ass},format=yuv420p'
-
-    cmd = [
-        'ffmpeg', '-y',
-        '-i', mp4_path,
-        '-vf', vf_filter,
-        '-c:v', 'h264_videotoolbox',
-        '-b:v', '60M',
-        '-realtime', '0',
-        '-c:a', 'copy',
-        out_path,
-    ]
+    # Encoder selection based on quality setting:
+    #   'fast'  = H264 hardware  60Mbps  — fastest, good quality
+    #   'hq'    = H264 hardware 120Mbps  — near-original, default
+    #   'hevc'  = HEVC hardware  70Mbps  — matches source codec/bitrate
+    #             NOTE: hevc_videotoolbox may fall back to software with the
+    #             subtitles filter (-12908 session error), which is very slow.
+    if quality == 'hevc':
+        vf_filter = f'subtitles={safe_ass},format=p010le'
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', mp4_path,
+            '-vf', vf_filter,
+            '-c:v', 'hevc_videotoolbox',
+            '-b:v', '70M',
+            '-allow_sw', '1',
+            '-tag:v', 'hvc1',
+            '-realtime', '0',
+            '-c:a', 'copy',
+            out_path,
+        ]
+    else:
+        bitrate = '60M' if quality == 'fast' else '120M'
+        vf_filter = f'subtitles={safe_ass},format=yuv420p'
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', mp4_path,
+            '-vf', vf_filter,
+            '-c:v', 'h264_videotoolbox',
+            '-b:v', bitrate,
+            '-maxrate', bitrate,
+            '-realtime', '0',
+            '-c:a', 'copy',
+            out_path,
+        ]
 
     # Two separate pipes — stdout discarded, stderr read for progress + errors.
     # Do NOT use -progress pipe:N; ffmpeg writes progress to stderr by default

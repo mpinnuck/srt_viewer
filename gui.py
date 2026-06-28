@@ -49,7 +49,7 @@ def _ensure_matplotlib():
     _mpl_ready = True
 
 
-APP_VERSION = '2.2'
+APP_VERSION = '2.3'
 
 # ---------------------------------------------------------------------------
 # Colour palette
@@ -802,11 +802,20 @@ class HudExportDialog(tk.Toplevel):
         ph = parent.winfo_height()
         px = parent.winfo_rootx()
         py = parent.winfo_rooty()
-        dw, dh = 1020, 660
+        dw, dh = 1020, 645
         self.geometry(f'{dw}x{dh}+{px + (pw - dw)//2}+{py + (ph - dh)//2}')
 
         # State
-        self._mp4_path    = tk.StringVar()
+        # Auto-detect MP4: same directory and base name as the SRT file
+        _srt = controller.filepath or ''
+        _mp4_guess = ''
+        if _srt:
+            _base = os.path.splitext(_srt)[0]
+            for _ext in ('.MP4', '.mp4', '.MOV', '.mov'):
+                if os.path.isfile(_base + _ext):
+                    _mp4_guess = _base + _ext
+                    break
+        self._mp4_path    = tk.StringVar(value=_mp4_guess)
         self._parse_done  = False
         self._exporting   = False
         self._preview_img = None   # numpy array
@@ -826,9 +835,13 @@ class HudExportDialog(tk.Toplevel):
         self._font_col   = tk.StringVar(value=config.get('hud_font_colour', 'FFFFFF'))
         self._bg_alpha   = tk.IntVar(value=int(config.get('hud_bg_alpha', 140)))
         self._bold       = tk.BooleanVar(value=bool(config.get('hud_bold', True)))
+        self._quality    = tk.StringVar(value=config.get('hud_quality', 'hq'))
 
         self._progress_var = tk.DoubleVar(value=0)
-        self._status_var   = tk.StringVar(value='Select the matching MP4 file to begin.')
+        self._status_var        = tk.StringVar(value='Select the matching MP4 file to begin.')
+        self._eta_var           = tk.StringVar(value='')
+        self._export_start_time = None
+        self._export_start_pct  = 0.0
 
         # Wire controller HUD callbacks
         controller.on_hud_parse_progress  = self._on_parse_progress
@@ -841,6 +854,9 @@ class HudExportDialog(tk.Toplevel):
         self.grab_set()   # make modal
         self.focus_set()
         self.protocol('WM_DELETE_WINDOW', self._on_close)
+        # If MP4 was auto-detected, start parsing immediately
+        if _mp4_guess:
+            self.after(100, self._auto_start_parse)
         self.after(100, self._poll_ui)   # start background-event polling
 
     # ------------------------------------------------------------------
@@ -851,9 +867,14 @@ class HudExportDialog(tk.Toplevel):
         # Pack bottom FIRST so it gets space before outer expands
         bottom = tk.Frame(self, bg=BG, padx=10, pady=4)
         bottom.pack(fill=tk.X, side=tk.BOTTOM)
-        tk.Label(bottom, textvariable=self._status_var,
+        status_row = tk.Frame(bottom, bg=BG)
+        status_row.pack(fill=tk.X)
+        tk.Label(status_row, textvariable=self._status_var,
                  fg=SUBTEXT, bg=BG, font=('SF Mono', 9)
-                 ).pack(anchor=tk.W)
+                 ).pack(side=tk.LEFT, anchor=tk.W)
+        tk.Label(status_row, textvariable=self._eta_var,
+                 fg=ACCENT, bg=BG, font=('SF Mono', 9)
+                 ).pack(side=tk.RIGHT, anchor=tk.E)
         self._pbar = tk.Canvas(bottom, height=26, bg=BG2,
                                highlightthickness=1,
                                highlightbackground=GRID)
@@ -876,6 +897,33 @@ class HudExportDialog(tk.Toplevel):
 
         self._build_left(left)
         self._build_right(right)
+
+    def _update_eta(self, pct: float):
+        """Update the ETA label based on elapsed time and current progress."""
+        import time as _time
+        if self._export_start_time is None or pct <= 0:
+            return
+        elapsed = _time.monotonic() - self._export_start_time
+        if elapsed < 2.0:
+            return   # too early for a reliable estimate
+        # pct is 0-100; remaining fraction of total work
+        remaining_pct = 100.0 - pct
+        if remaining_pct <= 0:
+            self._eta_var.set('Almost done…')
+            return
+        rate = pct / elapsed      # percent per second
+        eta_s = remaining_pct / rate
+        # Format nicely
+        if eta_s < 60:
+            eta_str = f'{int(eta_s)}s remaining'
+        elif eta_s < 3600:
+            m, s = divmod(int(eta_s), 60)
+            eta_str = f'{m}m {s:02d}s remaining'
+        else:
+            h, rem = divmod(int(eta_s), 3600)
+            m = rem // 60
+            eta_str = f'{h}h {m:02d}m remaining'
+        self._eta_var.set(eta_str)
 
     def _redraw_pbar(self):
         c = self._pbar
@@ -944,23 +992,6 @@ class HudExportDialog(tk.Toplevel):
                         variable=self._show_hag,
                         command=self._settings_changed).pack(anchor='w')
 
-        # ---- Units ----
-        units = self._section(parent, 'Units')
-        uf = ttk.Frame(units, style='TFrame')
-        uf.pack(fill=tk.X)
-        ttk.Label(uf, text='Speed:').pack(side=tk.LEFT)
-        ttk.Radiobutton(uf, text='km/h', variable=self._speed_unit,
-                        value='kmh', command=self._settings_changed).pack(side=tk.LEFT, padx=4)
-        ttk.Radiobutton(uf, text='m/s', variable=self._speed_unit,
-                        value='ms', command=self._settings_changed).pack(side=tk.LEFT)
-        af = ttk.Frame(units, style='TFrame')
-        af.pack(fill=tk.X, pady=(4, 0))
-        ttk.Label(af, text='Altitude:').pack(side=tk.LEFT)
-        ttk.Radiobutton(af, text='Relative', variable=self._alt_type,
-                        value='rel', command=self._settings_changed).pack(side=tk.LEFT, padx=4)
-        ttk.Radiobutton(af, text='Absolute', variable=self._alt_type,
-                        value='abs', command=self._settings_changed).pack(side=tk.LEFT)
-
         # ---- Position ----
         pos = self._section(parent, 'Position')
         cf = ttk.Frame(pos, style='TFrame')
@@ -1006,9 +1037,11 @@ class HudExportDialog(tk.Toplevel):
                   ).grid(row=0, column=0, sticky='w', pady=(0, 4))
 
         # Preview canvas
-        self._preview_frame = tk.Frame(parent, bg=BG2, relief='flat')
-        self._preview_frame.grid(row=1, column=0, sticky='nsew')
-        parent.rowconfigure(1, weight=1)
+        self._preview_frame = tk.Frame(parent, bg=BG2, relief='flat',
+                                       height=300)
+        self._preview_frame.grid(row=1, column=0, sticky='ew', pady=(0, 4))
+        self._preview_frame.grid_propagate(False)
+        parent.rowconfigure(1, weight=0)
         parent.columnconfigure(0, weight=1)
 
         self._preview_label = tk.Label(self._preview_frame,
@@ -1036,9 +1069,57 @@ class HudExportDialog(tk.Toplevel):
                                        command=self._on_close, state='normal')
         self._btn_cancel.grid(row=0, column=2, padx=4, sticky='ew')
 
+        # ---- Units ----
+        units = tk.LabelFrame(parent, text='Units',
+                              bg=BG, fg=ACCENT, font=('SF Pro Display', 9, 'bold'),
+                              relief='flat', bd=1,
+                              highlightbackground=GRID, highlightthickness=1,
+                              padx=8, pady=6)
+        units.grid(row=3, column=0, sticky='ew', pady=(8, 4))
+        uf = ttk.Frame(units, style='TFrame')
+        uf.pack(fill=tk.X)
+        ttk.Label(uf, text='Speed:').pack(side=tk.LEFT)
+        ttk.Radiobutton(uf, text='km/h', variable=self._speed_unit,
+                        value='kmh', command=self._settings_changed).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(uf, text='m/s', variable=self._speed_unit,
+                        value='ms', command=self._settings_changed).pack(side=tk.LEFT)
+        af = ttk.Frame(units, style='TFrame')
+        af.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(af, text='Altitude:').pack(side=tk.LEFT)
+        ttk.Radiobutton(af, text='Relative', variable=self._alt_type,
+                        value='rel', command=self._settings_changed).pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(af, text='Absolute', variable=self._alt_type,
+                        value='abs', command=self._settings_changed).pack(side=tk.LEFT)
+
+        # ---- Export Quality ----
+        qf = tk.LabelFrame(parent, text='Export Quality',
+                           bg=BG, fg=ACCENT, font=('SF Pro Display', 9, 'bold'),
+                           relief='flat', bd=1,
+                           highlightbackground=GRID, highlightthickness=1,
+                           padx=8, pady=6)
+        qf.grid(row=4, column=0, sticky='ew', pady=(0, 4))
+        ttk.Radiobutton(qf, text='High Quality  (H264 120Mbps — near-original)',
+                        variable=self._quality, value='hq').pack(anchor='w')
+        ttk.Radiobutton(qf, text='Fast  (H264 60Mbps — good quality, smaller file)',
+                        variable=self._quality, value='fast').pack(anchor='w')
+        ttk.Radiobutton(qf, text='Match Source  (HEVC 70Mbps — same codec, may be slow)',
+                        variable=self._quality, value='hevc').pack(anchor='w')
+
     # ------------------------------------------------------------------
     # MP4 browse
     # ------------------------------------------------------------------
+
+    def _auto_start_parse(self):
+        """Trigger parse automatically when MP4 is pre-populated."""
+        mp4 = self._mp4_path.get()
+        if not mp4 or not os.path.isfile(mp4):
+            return
+        self._status(f'Auto-detected {os.path.basename(mp4)} — parsing SRT…')
+        self._btn_export.config(state='disabled')
+        self._btn_preview.config(state='disabled')
+        self._polling = True
+        self.after(100, self._poll_ui)
+        self.controller.build_hud_frames_async()
 
     def _browse_mp4(self):
         init = self.config.get('hud_last_mp4_dir', '') or \
@@ -1087,7 +1168,8 @@ class HudExportDialog(tk.Toplevel):
                                    parent=self)
             return
         self._status('Rendering preview…')
-        cfg = self._make_hud_config()
+        cfg     = self._make_hud_config()
+        quality = self._quality.get()
         threading.Thread(target=self._preview_worker,
                          args=(mp4, cfg), daemon=True).start()
 
@@ -1177,14 +1259,19 @@ class HudExportDialog(tk.Toplevel):
         self._btn_export.config(state='disabled')
         self._btn_preview.config(state='disabled')
         self._status('Exporting — ffmpeg encoding…')
+        import time as _time
+        self._export_start_time = _time.monotonic()
+        self._export_start_pct  = 0.0
+        self._eta_var.set('')
         self._set_pbar(0)
         self._save_settings()
-        cfg = self._make_hud_config()
+        cfg     = self._make_hud_config()
+        quality = self._quality.get()
         # Restart the poll loop — macOS native save panel suspends Tk's event
         # loop while open, so the after() chain started in __init__ stops ticking.
         self._polling = True
         self.after(100, self._poll_ui)
-        self.controller.export_hud_video(mp4, out_path, cfg)
+        self.controller.export_hud_video(mp4, out_path, cfg, quality=quality)
 
     # ------------------------------------------------------------------
     # Controller callbacks (fire on background thread → post to queue)
@@ -1214,7 +1301,9 @@ class HudExportDialog(tk.Toplevel):
             while True:
                 event, *args = self._ui_queue.get_nowait()
                 if event == 'progress':
-                    self._set_pbar(args[0])
+                    pct = args[0]
+                    self._set_pbar(pct)
+                    self._update_eta(pct)
                 elif event == 'status':
                     self._status_var.set(args[0])
                 elif event == 'parse_complete':
@@ -1227,6 +1316,8 @@ class HudExportDialog(tk.Toplevel):
                     if self._mp4_path.get() and os.path.isfile(self._mp4_path.get()):
                         self._refresh_preview()
                 elif event == 'export_complete':
+                    self._eta_var.set('')
+                    self._export_start_time = None
                     out_path = args[0]
                     self._exporting = False
                     self._set_pbar(100)
@@ -1240,6 +1331,9 @@ class HudExportDialog(tk.Toplevel):
                     ):
                         _reveal_in_finder(out_path)
                 elif event == 'export_error':
+                    self._eta_var.set('')
+                    self._export_start_time = None
+                    self._set_pbar(0)
                     msg = args[0]
                     self._exporting = False
                     self._btn_export.config(state='normal')
@@ -1281,6 +1375,7 @@ class HudExportDialog(tk.Toplevel):
         c.set('hud_font_colour',   self._font_col.get().lstrip('#').upper() or 'FFFFFF')
         c.set('hud_bg_alpha',      self._bg_alpha.get())
         c.set('hud_bold',          self._bold.get())
+        c.set('hud_quality',       self._quality.get())
         c.save()
 
     def _on_close(self):
